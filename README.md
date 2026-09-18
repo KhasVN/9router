@@ -1,3 +1,5 @@
+> **Maintained fork:** [khasvn/9router images](https://hub.docker.com/r/khasvn/9router), [patches and upstream updates](AURANION.md), [deployment](deploy/README.md). Instructions below describe upstream; npm releases do not contain this fork's patches.
+
 <div align="center">
   <img src="./images/9router.png?1" alt="9Router Dashboard" width="800"/>
   

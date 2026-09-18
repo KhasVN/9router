@@ -1,0 +1,31 @@
+name: auranion-gateway
+
+services:
+  gateway:
+    image: ${NINEROUTER_IMAGE:?Set NINEROUTER_IMAGE to the tested manifest digest}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${NINEROUTER_PORT:-20128}:20128"
+    environment:
+      INITIAL_PASSWORD: ${INITIAL_PASSWORD:?Set a strong dashboard password}
+      JWT_SECRET: ${JWT_SECRET:?Set a random session signing secret}
+      API_KEY_SECRET: ${API_KEY_SECRET:?Set a random API key secret}
+      MACHINE_ID_SALT: ${MACHINE_ID_SALT:?Set a random machine identity salt}
+      DATA_DIR: /app/data
+      HOME: /app/data-home
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      NEXT_TELEMETRY_DISABLED: '1'
+    volumes:
+      - data:/app/data
+      - home:/app/data-home
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:20128/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+volumes:
+  data:
+  home:

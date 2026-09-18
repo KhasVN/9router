@@ -132,7 +132,10 @@ if (mode === "fixture") {
       });
       const wire = await response.text();
       assert.equal(response.status, expected, `${path} ${model}: ${wire.slice(0,500)}`);
-      if (expected !== 200) { assert(JSON.parse(wire).error); return; }
+      if (expected !== 200) {
+        assert.match(JSON.parse(wire).error.message, /Upstream (SSE stream ended before a finish reason|Responses stream did not complete successfully)/);
+        return;
+      }
       if (stream) {
         assert.match(response.headers.get("content-type"), /text\/event-stream/);
         const events = wire.split(/\r?\n/).filter(l => l.startsWith("data:") && l.slice(5).trim() !== "[DONE]").map(l => JSON.parse(l.slice(5)));
@@ -167,7 +170,8 @@ if (mode === "fixture") {
     for (const [connection, provider, route] of [[cmc, "cmc", "truncated"], [codex, "cx", "truncated"], [codex, "cx", "failed"]]) {
       const badPool = (await admin("/api/proxy-pools", { name: route, type: "vercel", proxyUrl: `http://fixture:8080/${route}` })).proxyPool;
       await admin(`/api/providers/${connection.id}`, { proxyPoolId: badPool.id }, "PUT");
-      await invoke("/v1/messages", `${provider}/fixture-${route}`, false, 502);
+      // chatCore rejects with 502; account exhaustion exposes 503 at the HTTP boundary.
+      await invoke("/v1/messages", `${provider}/fixture-${route}`, false, 503);
       console.log(`PASS rejects ${provider} ${route} upstream`);
     }
     const seen = await (await fetch("http://fixture:8080/seen")).json();

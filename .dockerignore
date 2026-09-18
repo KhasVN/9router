@@ -20,7 +20,9 @@ logs
 
 # Local env files (inject at runtime via --env-file or -e)
 .env*
+**/.env*
 !.env.example
+!**/.env.example
 .claude
 .github
 .temp

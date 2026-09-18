@@ -44,4 +44,4 @@ The CI matrix builds and runs each image natively on Linux AMD64 and ARM64. Only
 
 Docker Hub credentials live only in encrypted repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`. Pull-request jobs never receive those credentials. Rotate the PAT in Docker Hub and update the secret before its expiry.
 
-The parent `auranion-config` repository pins this fork as a submodule and supplies deployment configuration. Publishing an image does not upgrade any running gateway. Public-provider latency, credentials, routing and Cloudflare behavior are not proven by fixture tests.
+This fork is standalone. [Deployment configuration](deploy/README.md) lives in this repository; no `auranion-config` submodule is needed. Publishing an image does not upgrade any running gateway. Public-provider latency, credentials, routing and Cloudflare behavior are not proven by fixture tests.
