@@ -19,11 +19,12 @@ data
 logs
 
 # Local env files (inject at runtime via --env-file or -e)
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env*
+!.env.example
+.claude
+.github
+.temp
+*.log
 
 # Debug logs
 npm-debug.log*

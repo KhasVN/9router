@@ -1,0 +1,30 @@
+name: Auranion upstream sync
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: auranion-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'KhasVN/9router' && github.ref == 'refs/heads/auranion'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: auranion
+          fetch-depth: 0
+      - name: Mirror upstream and open a reviewable merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/auranion-sync.sh
