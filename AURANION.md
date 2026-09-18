@@ -27,7 +27,7 @@ Keep regression checks when upstream implements equivalent fixes; remove redunda
 ## Verification and publishing
 
 ```bash
-node --test tests/commandcode-claude-regression.test.mjs
+node --test tests/commandcode-claude-regression.test.mjs tests/commandcode-upstream-regression.test.mjs
 ```
 
 ```bash
@@ -38,7 +38,9 @@ docker build -t 9router:test .
 node tests/docker-smoke.mjs 9router:test
 ```
 
-The smoke check uses the real production entrypoint, HTTP routes, SQLite, authentication, executors and translators. A Docker-internal network blocks external provider traffic. It checks Claude Messages, duplicated `/v1/v1/messages`, native Responses, Unicode tool calls, JSON fallback, truncated/failed streams, and persistence after container replacement. Only uniquely named test containers, network and volume are removed.
+Offline regression checks cover stream replay, native Claude JSON, images, reasoning effort, actual executor retries, packed errors and quota mapping with dummy fixtures.
+
+The smoke check uses the real production entrypoint, HTTP routes, SQLite, authentication, executors and translators. A Docker-internal network blocks external provider traffic. It checks Claude Messages, duplicated `/v1/v1/messages`, native Responses, Unicode tool calls, JSON fallback, image/effort forwarding, transient retries, packed errors, truncated/failed streams, and persistence after container replacement. Only uniquely named test containers, network and volume are removed.
 
 The CI matrix builds and runs each image natively on Linux AMD64 and ARM64. Only successfully tested images are pushed. After both pass, a manifest receives `sha-<full-commit>`, `auranion` and `latest` tags. Tags are mutable registry references; pin the manifest digest for reproducible deployment. A rerun may resolve newer upstream dependencies because upstream does not track a lockfile.
 

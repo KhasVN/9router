@@ -35,7 +35,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      - run: node --test tests/commandcode-claude-regression.test.mjs
+      - run: node --test tests/commandcode-claude-regression.test.mjs tests/commandcode-upstream-regression.test.mjs
       - uses: docker/setup-buildx-action@v4
       - name: Build candidate once
         uses: docker/build-push-action@v7

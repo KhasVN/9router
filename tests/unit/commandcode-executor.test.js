@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from "vitest";
 import {
   parseCommandCodeError,
   inspectAndWrapCommandCodeResponse,
-  CommandCodeExecutor,
 } from "../../open-sse/executors/commandcode.js";
 import { handleComboChat } from "../../open-sse/services/combo.js";
 
@@ -132,6 +131,8 @@ describe("inspectAndWrapCommandCodeResponse", () => {
     expect(text).toContain("Hello from Laguna");
     expect(text).toContain("data: [DONE]");
   });
+
+  // Actual executor retry coverage lives in ../commandcode-upstream-regression.test.mjs.
 });
 
 describe("CommandCode in Combo Fallback", () => {

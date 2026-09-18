@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 
+const png = Buffer.from("89504e470d0a1a0a00000000", "hex").toString("base64");
 const input = { file_path: "café/文.txt" };
 const tool = { id: "call_fixture", name: "Read", arguments: JSON.stringify(input) };
 const mode = process.argv[2];
@@ -30,17 +31,25 @@ if (mode === "fixture") {
       const command = target.includes("commandcode");
       assert.equal(command ? body.params.stream : body.stream, true);
       const model = command ? body.params.model : body.model;
+      if (model === "fixture-vision") {
+        assert.equal(body.params.reasoning_effort, "high");
+        const image = body.params.messages.flatMap(m => Array.isArray(m.content) ? m.content : []).find(b => b.type === "image");
+        assert.equal(image?.image, `data:image/png;base64,${png}`);
+      }
       const truncated = req.url === "/truncated";
       const failed = req.url === "/failed";
+      const midstreamError = req.url === "/error";
+      const retry = req.url === "/retry" && !seen.some(r => r.model === model);
       seen.push({ target, path, model, truncated, failed });
-      const ndjson = [
+      const error = { type: "error", error: { statusCode: 503, message: "Fixture upstream failure" } };
+      const ndjson = retry ? [error] : [
         { type: "start" },
         { type: "reasoning-delta", text: "Inspect fixture." },
         { type: "text-delta", text: "Reading fixture." },
         { type: "tool-input-start", id: tool.id, toolName: tool.name },
         { type: "tool-input-delta", id: tool.id, delta: tool.arguments },
         { type: "tool-call", toolCallId: tool.id, toolName: tool.name, input },
-        ...(!truncated ? [
+        ...(midstreamError ? [error] : !truncated ? [
           { type: "finish-step", finishReason: "tool-calls", usage: { inputTokens: 12, outputTokens: 7, totalTokens: 19 } },
           { type: "finish" },
         ] : []),
@@ -121,24 +130,30 @@ if (mode === "fixture") {
     const alias = "claude-haiku-4-5-20251001";
     await admin("/api/combos", { name: alias, models: ["cmc/fixture-model"] });
     const properties = { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] };
-    async function invoke(path, model, stream, expected = 200) {
+    async function invoke(path, model, stream, expected = 200, extra = {}) {
       const responses = path.endsWith("responses");
       const body = responses
         ? { model, stream, input: [{ role: "user", content: "Read fixture" }], tools: [{ type: "function", name: "Read", parameters: properties }] }
         : { model, stream, max_tokens: 128, messages: [{ role: "user", content: "Read fixture" }], tools: [{ name: "Read", input_schema: properties }] };
       const response = await fetch(base + path, {
         method: "POST", headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
+        body: JSON.stringify({ ...body, ...extra }), signal: AbortSignal.timeout(30000),
       });
       const wire = await response.text();
       assert.equal(response.status, expected, `${path} ${model}: ${wire.slice(0,500)}`);
       if (expected !== 200) {
-        assert.match(JSON.parse(wire).error.message, /Upstream (SSE stream ended before a finish reason|Responses stream did not complete successfully)/);
+        assert.match(JSON.parse(wire).error.message, /Upstream (SSE stream ended before a finish reason|Responses stream did not complete successfully)|Failed to convert streaming response to JSON/);
         return;
       }
       if (stream) {
         assert.match(response.headers.get("content-type"), /text\/event-stream/);
         const events = wire.split(/\r?\n/).filter(l => l.startsWith("data:") && l.slice(5).trim() !== "[DONE]").map(l => JSON.parse(l.slice(5)));
+        if (model.includes("fixture-error")) {
+          assert(events.some(e => e.error), "Packed upstream error disappeared");
+          assert(!events.some(e => e.type === "message_stop" || e.type === "response.completed"), "Upstream error became a successful turn");
+          console.log(`PASS ${path} rejects packed midstream error`);
+          return;
+        }
         assert.equal(events.filter(e => e.type === (responses ? "response.completed" : "message_stop")).length, 1);
         const args = responses
           ? events.filter(e => e.type === "response.function_call_arguments.delta").map(e => e.delta).join("")
@@ -167,14 +182,26 @@ if (mode === "fixture") {
     }
     await invoke("/v1/messages", "cx/fixture-model", false);
     await invoke("/v1/responses", "cx/fixture-model", false);
-    for (const [connection, provider, route] of [[cmc, "cmc", "truncated"], [codex, "cx", "truncated"], [codex, "cx", "failed"]]) {
+    await invoke("/v1/messages", "cmc/fixture-vision", false, 200, {
+      output_config: { effort: "high" },
+      messages: [{ role: "user", content: [{ type: "text", text: "Describe fixture" }, { type: "image", source: { type: "base64", media_type: "image/png", data: png } }] }],
+    });
+    for (const route of ["retry", "error"]) {
+      const routePool = (await admin("/api/proxy-pools", { name: route, type: "vercel", proxyUrl: `http://fixture:8080/${route}` })).proxyPool;
+      await admin(`/api/providers/${cmc.id}`, { proxyPoolId: routePool.id }, "PUT");
+      if (route === "retry") await invoke("/v1/messages", "cmc/fixture-retry", false);
+      else for (const path of ["/v1/messages", "/v1/responses"]) await invoke(path, "cmc/fixture-error", true);
+    }
+    for (const [connection, provider, route] of [[cmc, "cmc", "error"], [cmc, "cmc", "truncated"], [codex, "cx", "truncated"], [codex, "cx", "failed"]]) {
       const badPool = (await admin("/api/proxy-pools", { name: route, type: "vercel", proxyUrl: `http://fixture:8080/${route}` })).proxyPool;
       await admin(`/api/providers/${connection.id}`, { proxyPoolId: badPool.id }, "PUT");
       // chatCore rejects with 502; account exhaustion exposes 503 at the HTTP boundary.
-      await invoke("/v1/messages", `${provider}/fixture-${route}`, false, 503);
+      await invoke("/v1/messages", `${provider}/fixture-${route}-json`, false, 503);
       console.log(`PASS rejects ${provider} ${route} upstream`);
     }
     const seen = await (await fetch("http://fixture:8080/seen")).json();
+    assert.equal(seen.filter(r => r.model === "fixture-retry").length, 2, "Transient failure must retry once");
+    assert(seen.some(r => r.model === "fixture-vision"), "Image and effort did not reach upstream");
     assert(seen.length >= 11, "Requests did not reach actual fixture upstream");
     assert(seen.some(r => r.target === "https://api.commandcode.ai"));
     assert(seen.some(r => r.target === "https://chatgpt.com"));
