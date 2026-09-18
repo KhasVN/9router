@@ -127,30 +127,26 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
   const reader = originalResponse.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  const bufferedLines = [];
+  // Replay raw bytes, including events after the peek and any split UTF-8 character.
+  const bufferedChunks = [];
   let detectedError = null;
 
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) {
-        const trimmed = buffer.trim();
+        const trimmed = (buffer + decoder.decode()).trim();
         if (trimmed) {
           try {
             const jsonStr = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
             const parsed = JSON.parse(jsonStr);
-            if (parsed?.type === "error") {
-              detectedError = parsed;
-            } else {
-              bufferedLines.push(trimmed);
-            }
-          } catch {
-            bufferedLines.push(trimmed);
-          }
+            if (parsed?.type === "error") detectedError = parsed;
+          } catch { /* replay unparsed bytes below */ }
         }
         break;
       }
 
+      bufferedChunks.push(value);
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -161,7 +157,6 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
         if (!trimmed) continue;
         const jsonStr = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
         if (!jsonStr || jsonStr === "[DONE]") {
-          bufferedLines.push(trimmed);
           stopLoop = true;
           break;
         }
@@ -170,7 +165,6 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
         try {
           event = JSON.parse(jsonStr);
         } catch {
-          bufferedLines.push(trimmed);
           continue;
         }
 
@@ -179,8 +173,6 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
           stopLoop = true;
           break;
         }
-
-        bufferedLines.push(trimmed);
 
         if (
           event?.type === "text-delta" ||
@@ -197,9 +189,9 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
 
       if (stopLoop) break;
     }
-  } catch {
-    try { reader.releaseLock(); } catch { /* ignore */ }
-    return originalResponse;
+  } catch (err) {
+    try { await reader.cancel(err); } catch { /* ignore */ }
+    throw err;
   }
 
   if (detectedError) {
@@ -224,31 +216,16 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
     );
   }
 
-  const combinedStream = createReplayedStream(bufferedLines, buffer, reader);
+  const combinedStream = createReplayedStream(bufferedChunks, reader);
   return wrapNdjsonAsOpenAISse(combinedStream, model, originalResponse);
 }
 
-function createReplayedStream(bufferedLines, remainingBuffer, reader) {
-  const encoder = new TextEncoder();
-  let replayed = false;
-
+function createReplayedStream(bufferedChunks, reader) {
   return new ReadableStream({
+    start(controller) {
+      for (const chunk of bufferedChunks) controller.enqueue(chunk);
+    },
     async pull(controller) {
-      if (!replayed) {
-        replayed = true;
-        let prefix = bufferedLines.join("\n");
-        if (prefix && remainingBuffer) {
-          prefix += "\n" + remainingBuffer;
-        } else if (remainingBuffer) {
-          prefix = remainingBuffer;
-        } else if (prefix) {
-          prefix += "\n";
-        }
-        if (prefix) {
-          controller.enqueue(encoder.encode(prefix));
-        }
-      }
-
       try {
         const { value, done } = await reader.read();
         if (done) {
