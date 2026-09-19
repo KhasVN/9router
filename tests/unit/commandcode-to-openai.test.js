@@ -121,4 +121,19 @@ describe("commandcode-to-openai — error event", () => {
       { type: "error", error: { type: "server_error", message: "Boom" } },
     ])).toThrow('[CommandCode error: {"type":"server_error","message":"Boom"}]');
   });
+
+  it("throws on finish-step with finishReason=error instead of emitting fake stop", () => {
+    expect(() => feed([
+      { type: "text-delta", text: "partial response" },
+      { type: "finish-step", finishReason: "error", error: "step failed" },
+    ])).toThrow("[CommandCode error: step failed]");
+  });
+
+  it("throws on finish with finishReason=error instead of emitting fake stop", () => {
+    expect(() => feed([
+      { type: "text-delta", text: "partial response" },
+      { type: "finish-step", finishReason: "stop" },
+      { type: "finish", finishReason: "error" },
+    ])).toThrow("[CommandCode error: upstream generation error]");
+  });
 });

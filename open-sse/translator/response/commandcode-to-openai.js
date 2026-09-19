@@ -151,11 +151,23 @@ export function commandCodeToOpenAIResponse(chunk, state) {
       break;
     }
     case "finish-step": {
+      // AI SDK v5: finishReason "error" = "model stopped because of an error".
+      // Mapping it to a normal stop would hand the client a fabricated success.
+      if (event.finishReason === "error") {
+        const errVal = event.error ?? "upstream generation error";
+        const errStr = typeof errVal === "string" ? errVal : JSON.stringify(errVal);
+        throw new Error(`[CommandCode error: ${errStr}]`);
+      }
       state.finishReason = mapFinishReason(event.finishReason);
       if (event.usage) state.usage = event.usage;
       break;
     }
     case "finish": {
+      if (event.finishReason === "error") {
+        const errVal = event.error ?? "upstream generation error";
+        const errStr = typeof errVal === "string" ? errVal : JSON.stringify(errVal);
+        throw new Error(`[CommandCode error: ${errStr}]`);
+      }
       const finishReason = state.finishReason || mapFinishReason(event.finishReason || "stop");
       const finalChunk = makeChunk(state, {}, finishReason);
       const totalUsage = event.totalUsage || state.usage;
@@ -170,6 +182,13 @@ export function commandCodeToOpenAIResponse(chunk, state) {
       // Mid-stream error: throw rather than emitting as fake content with finish_reason: "stop"
       // This ensures the downstream stream handler marks the stream as errored/aborted.
       throw new Error(`[CommandCode error: ${errStr}]`);
+    }
+    case "abort": {
+      // AI SDK v5: the generation was aborted before producing a terminal part.
+      // Ignoring it (the default arm) ends the stream with no finish chunk at all,
+      // leaving the client on a truncated turn with nothing to report.
+      const reason = event.reason ? `: ${typeof event.reason === "string" ? event.reason : JSON.stringify(event.reason)}` : "";
+      throw new Error(`[CommandCode error: upstream aborted the stream${reason}]`);
     }
     // Silently ignore: start, start-step, reasoning-start, reasoning-end, text-start, text-end,
     // provider-metadata, message-metadata, etc. They carry no client-visible content.

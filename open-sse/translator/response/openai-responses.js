@@ -580,18 +580,17 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     if (state.finishReasonSent) return null;
 
     const error = data.error || data.response?.error;
-    if (error) {
-      state.error = error;
-      state.finishReasonSent = true;
+    state.error = error || { message: "upstream response failed" };
+    // Terminal: a later flush() must not synthesize a finish chunk for a failure.
+    state.finishReasonSent = true;
 
-      // Surface the error as an OpenAI-compatible error chunk
-      return buildChunk(
-        { id: state.chatId || `chatcmpl-${Date.now()}`, created: state.created || Math.floor(Date.now() / 1000), model: state.model || MODEL_FALLBACK },
-        { content: `[Error] ${error.message || JSON.stringify(error)}` },
-        OPENAI_FINISH.STOP
-      );
-    }
-    return null;
+    // Throw rather than rewriting the failure as content + finish_reason "stop".
+    // A client cannot tell that fabricated stop from a real one, and a Claude
+    // client renders it as a successful message_stop — the exact fake stopping
+    // token this guards against. The stream handler turns the rejected stream
+    // into an in-band error frame for whatever format the client speaks.
+    const detail = error ? (error.message || JSON.stringify(error)) : data.response?.status || "upstream response failed";
+    throw new Error(`[Responses error: ${detail}]`);
   }
 
   // Reasoning summary delta → emit as reasoning_content for client thinking display

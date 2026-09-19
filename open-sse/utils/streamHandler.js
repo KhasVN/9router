@@ -104,12 +104,15 @@ export function createDisconnectAwareStream(transformStream, streamController, o
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
 
-  // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
-  const emitTerminal = (controller) => {
+  // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once.
+  // `message` overrides the watchdog's own reason: a translator that rejects the
+  // stream (upstream error event) knows the real cause, and the client must see
+  // that instead of a generic "upstream connection lost".
+  const emitTerminal = (controller, message = null) => {
     if (terminalEmitted || !onAbortTerminal) return;
     terminalEmitted = true;
     try {
-      const bytes = onAbortTerminal();
+      const bytes = onAbortTerminal(message);
       if (bytes) controller.enqueue(bytes);
     } catch { /* best-effort terminal */ }
   };
@@ -159,7 +162,10 @@ export function createDisconnectAwareStream(transformStream, streamController, o
         // (Responses passthrough prefers response.failed + [DONE] over a raw transport error)
         try {
           if (!wasConnected || isNetworkClose || onAbortTerminal) {
-            emitTerminal(controller);
+            // A translator rejection carries the upstream's own error text; a
+            // transport failure carries nothing useful, so keep the watchdog reason.
+            const reason = error?.message && !isNetworkClose ? error.message : null;
+            emitTerminal(controller, reason);
             controller.close();
           } else {
             controller.error(error);
@@ -254,7 +260,9 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   return createDisconnectAwareStream(
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
-    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null
+    // Forward a caller-supplied reason (a translator rejection carries the real
+    // upstream error) and fall back to the watchdog's own abort message.
+    onAbortTerminal ? (message = null) => onAbortTerminal(message ?? abortMessage) : null
   );
 }
 

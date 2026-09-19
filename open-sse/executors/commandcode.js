@@ -188,6 +188,21 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
           break;
         }
 
+        // AI SDK v5 also reports failure via finishReason "error" on the terminal
+        // parts. Treat it as an upstream error so the caller gets a non-2xx and can
+        // fall back to the next account/combo entry instead of streaming a 200.
+        if (
+          (event?.type === "finish-step" || event?.type === "finish") &&
+          event?.finishReason === "error"
+        ) {
+          detectedError = {
+            type: "error",
+            error: event.error ?? { message: "upstream generation error", statusCode: 503 },
+          };
+          stopLoop = true;
+          break;
+        }
+
         if (
           event?.type === "text-delta" ||
           event?.type === "reasoning-delta" ||

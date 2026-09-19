@@ -20,7 +20,14 @@ export function toOpenAIFinish(reason, format) {
         case "tool-calls":
         case "tool_use": return OPENAI_FINISH.TOOL_CALLS;
         case "content-filter": return OPENAI_FINISH.CONTENT_FILTER;
-        case "error": return OPENAI_FINISH.STOP;
+        // AI SDK v5: "error" = the model stopped because of an error. OpenAI has no
+        // matching finish_reason, so signal failure (null) — mapping it to STOP
+        // fabricates a completed turn out of an aborted one.
+        case "error": return null;
+        // Terminal but unspecified upstream states have no OpenAI literal either;
+        // stop is the only valid value, same as the gemini arm does for OTHER.
+        case "other":
+        case "unknown": return OPENAI_FINISH.STOP;
         default: return reason || OPENAI_FINISH.STOP;
       }
     case "gemini":

@@ -109,10 +109,23 @@ describe("GOLDEN response stream: OpenAI-Responses (codex) → OpenAI", () => {
     expect(runStream(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, events)).toMatchSnapshot();
   });
 
-  it("error event → error chunk (fallback id/created)", () => {
+  // An upstream error must not become `content: "[Error] …"` with finish_reason
+  // "stop": the client cannot distinguish that fabricated stop from a real one,
+  // and a Claude client renders it as a successful message_stop.
+  it("error event rejects the stream instead of emitting a fake stop", () => {
     const events = [
       { type: "error", error: { message: "model_not_found" } },
     ];
-    expect(runStream(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, events)).toMatchSnapshot();
+    expect(() => runStream(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, events))
+      .toThrow("[Responses error: model_not_found]");
+  });
+
+  it("response.failed without an error body still rejects", () => {
+    const events = [
+      { type: "response.created", response: { id: "resp_1" } },
+      { type: "response.failed", response: { status: "failed" } },
+    ];
+    expect(() => runStream(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, events))
+      .toThrow(/\[Responses error: failed\]/);
   });
 });

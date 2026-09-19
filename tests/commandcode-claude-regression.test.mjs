@@ -217,6 +217,22 @@ test("Truncated CommandCode streams never acquire successful Claude/Responses te
   }
 });
 
+test("CommandCode error finishReason rejects and never emits fake stopping token message_stop", async () => {
+  const errorEvents = [
+    { type: "start" },
+    { type: "text-delta", text: "Something went wrong upstream" },
+    { type: "finish-step", finishReason: "error", error: "upstream failed" },
+    { type: "finish" },
+  ];
+  const errorLines = [errorEvents.map(e => `${JSON.stringify(e)}\n`).join("")];
+  for (const format of ["claude", "openai-responses"]) {
+    await assert.rejects(async () => {
+      const output = await translated(errorLines, format);
+      assert(!output.some(e => e.type === "message_stop" || e.type === "response.completed"));
+    }, /CommandCode error/);
+  }
+});
+
 for (const [name, format, upstream] of [
   ["truncated Chat", "commandcode", () => wrapped([lines.slice(0, -2).join("")])],
   ["truncated Responses", "openai-responses", () => response([responsesWire(responsesEvents.slice(0, -1))])],
