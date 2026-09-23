@@ -4,13 +4,15 @@ import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.j
 import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
 import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
-import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
+import { parseSSEToOpenAIResponse, handleForcedSSEToJson } from "./sseToJsonHandler.js";
 import { unwrapClineEnvelope } from "../../shared/clineEnvelope.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
+import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
 import { openAICompletionToClaudeMessage } from "./claudeMessage.js";
+import { toResponsesFinish } from "../../translator/concerns/finishReason.js";
 
 /**
  * Convert an OpenAI Chat Completions non-streaming response body into the
@@ -70,14 +72,14 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
   }
 
   const usage = responseBody.usage || {};
-  const status = choice.finish_reason === "tool_calls" ? "completed" : (choice.finish_reason === "stop" ? "completed" : (choice.finish_reason || "completed"));
+  const terminal = toResponsesFinish(choice.finish_reason);
 
   return {
     id: `resp_${responseBody.id || ""}`.replace(/^resp_chatcmpl-/, "resp_"),
     object: "response",
     created_at: responseBody.created || Math.floor(Date.now() / 1000),
     model: responseBody.model || "unknown",
-    status,
+    ...terminal,
     background: false,
     error: null,
     output,
@@ -233,9 +235,20 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
  * Handle non-streaming response from provider.
  */
 export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqTag, log }) {
-  trackDone();
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
+
+  if (contentType.includes("text/event-stream") && targetFormat === FORMATS.OPENAI_RESPONSES) {
+    const forced = await handleForcedSSEToJson({
+      providerResponse, provider, model, sourceFormat, targetFormat, body, stream,
+      translatedBody, finalBody, requestStartTime, connectionId, apiKey,
+      clientRawRequest, onRequestSuccess, customToolNames, trackDone, appendLog,
+      reqTag, log
+    });
+    if (forced) return forced;
+  }
+
+  trackDone();
 
   if (contentType.includes("text/event-stream")) {
     const sseText = await providerResponse.text();
@@ -347,7 +360,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
 
   return {
     success: true,
-    response: new Response(JSON.stringify(translatedResponse), {
+    response: new Response(JSON.stringify(restoreToolNames(translatedResponse, toolNameMap)), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     })
   };

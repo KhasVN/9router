@@ -9,7 +9,7 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
-import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
+import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry, CODEX_SSE_PEEK_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { dbg } from "../utils/debugLog.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
@@ -17,14 +17,12 @@ import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
 // SSE error patterns inside 200-OK bodies. Some retry same account first; capacity rotates accounts.
 const CODEX_SSE_RETRY_PATTERNS = ["server_is_overloaded", "service_unavailable_error"];
 const CODEX_SSE_ACCOUNT_FALLBACK_PATTERNS = ["selected model is at capacity", "model_at_capacity"];
-const CODEX_SSE_USER_OUTPUT_PATTERNS = [
-  "event: response.output_text.delta",
-  "event: response.function_call_arguments.delta",
-  '"type":"response.output_text.delta"',
-  '"type":"response.function_call_arguments.delta"',
-];
+const CODEX_SSE_OUTPUT_EVENTS = new Set([
+  "response.output_text.delta", "response.reasoning_summary_text.delta",
+  "response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+  "response.completed", "response.done", "response.incomplete",
+]);
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
-const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
 
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
@@ -143,54 +141,37 @@ function normalizeReasoningEffort(model, value) {
   return value;
 }
 
-function findNestedMessage(value, depth = 0) {
-  if (!value || depth > 6 || typeof value === "string") return null;
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findNestedMessage(item, depth + 1);
-      if (found) return found;
-    }
-    return null;
-  }
-  if (typeof value !== "object") return null;
-  if (typeof value.message === "string" && value.message.trim()) return value.message;
-  if (typeof value.error?.message === "string" && value.error.message.trim()) return value.error.message;
-  if (typeof value.response?.error?.message === "string" && value.response.error.message.trim()) return value.response.error.message;
-  for (const child of Object.values(value)) {
-    const found = findNestedMessage(child, depth + 1);
-    if (found) return found;
-  }
-  return null;
+function classifySseError(eventName, data) {
+  const type = data?.type || eventName;
+  const status = data?.response?.status;
+  if (type !== "error" && type !== "response.failed" && !data?.error &&
+      status !== "failed" && status !== "cancelled") return null;
+  const raw = data.error || data.response?.error || data;
+  const error = typeof raw === "string" ? { message: raw } : raw;
+  const message = error.message || error.code || status || "upstream response failed";
+  // Search only structured error fields, never model-generated text/tool arguments.
+  const detail = `${error.code || ""} ${error.type || ""} ${message}`.toLowerCase();
+  const capacity = CODEX_SSE_ACCOUNT_FALLBACK_PATTERNS.find(p => detail.includes(p));
+  const retry = CODEX_SSE_RETRY_PATTERNS.find(p => detail.includes(p));
+  const explicitStatus = Number(error.statusCode || error.status || data.status_code);
+  const httpStatus = Number.isInteger(explicitStatus) && explicitStatus >= 400 && explicitStatus <= 599
+    ? explicitStatus
+    : capacity || retry ? HTTP_STATUS.SERVICE_UNAVAILABLE
+    : /rate_limit|usage_limit_reached|quota_exceeded/.test(detail) ? HTTP_STATUS.RATE_LIMITED
+    : /invalid_api_key|token_expired|token_invalid/.test(detail) ? HTTP_STATUS.UNAUTHORIZED
+    : /model_not_found/.test(detail) ? HTTP_STATUS.NOT_FOUND
+    : /invalid_request/.test(detail) ? HTTP_STATUS.BAD_REQUEST
+    : HTTP_STATUS.BAD_GATEWAY;
+  return {
+    matched: capacity || retry || type || "upstream_error", message,
+    accountFallback: !!capacity, retryable: !!retry && !capacity, status: httpStatus,
+    error: { ...error, message }, replacementBody: null,
+  };
 }
 
-function extractSseErrorMessage(text, fallback) {
-  const exact = text?.match(/Selected model is at capacity\. Please try a different model\./i)?.[0];
-  if (exact) return exact;
-
-  for (const line of String(text || "").split(/\r?\n/)) {
-    if (!line.startsWith("data:")) continue;
-    const data = line.slice(5).trim();
-    if (!data || data === "[DONE]") continue;
-    try {
-      const message = findNestedMessage(JSON.parse(data));
-      if (message) return message;
-    } catch {
-      // Ignore non-JSON SSE data lines.
-    }
-  }
-
-  return fallback || CODEX_MODEL_CAPACITY_MESSAGE;
-}
-
-function codexSseErrorResponse(status, message) {
-  return new Response(JSON.stringify({
-    error: {
-      message,
-      type: status >= 500 ? "server_error" : "invalid_request_error",
-      code: status === HTTP_STATUS.SERVICE_UNAVAILABLE ? "service_unavailable" : "upstream_error",
-    }
-  }), {
-    status,
+function codexSseErrorResponse(peek) {
+  return new Response(JSON.stringify({ error: peek.error }), {
+    status: peek.status,
     headers: { "Content-Type": "application/json" },
   });
 }
@@ -296,14 +277,9 @@ export class CodexExecutor extends BaseExecutor {
         }
         return result;
       }
-      if (peek.accountFallback) {
-        args.log?.warn?.("RETRY", `CODEX | SSE account fallback "${peek.message}"`);
-        result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || CODEX_MODEL_CAPACITY_MESSAGE);
-        return result;
-      }
-      if (attempt >= attempts) {
-        args.log?.warn?.("RETRY", `CODEX | SSE overloaded "${peek.matched}" — retries exhausted (${attempt}/${attempts})`);
-        result.response = codexSseErrorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, peek.message || peek.matched);
+      if (!peek.retryable || attempt >= attempts) {
+        args.log?.warn?.("RETRY", `CODEX | SSE failure: ${peek.message}`);
+        result.response = codexSseErrorResponse(peek);
         return result;
       }
       attempt++;
@@ -313,62 +289,76 @@ export class CodexExecutor extends BaseExecutor {
     }
   }
 
-  // Peek first N bytes of SSE body to detect upstream transient errors.
-  // Returns { matched: string|null, message: string|null, accountFallback: boolean, replacementBody: ReadableStream|null }.
-  // Caller must use replacementBody when no error matched (original body has been read).
+  // ponytail: inspect at most 1s/256KiB before committing HTTP 200. Later errors
+  // travel in-band; retrying after client-visible output would duplicate a turn.
   async _peekSseTransientError(response) {
-    if (!response || !response.ok || !response.body) return { matched: null, message: null, accountFallback: false, replacementBody: null };
+    const noError = { matched: null, message: null, accountFallback: false, replacementBody: null };
+    if (!response?.ok || !response.body) return noError;
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType && !contentType.includes("text/event-stream")) return noError;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const chunks = [];
-    let text = "";
-    let matched = null;
-    let accountFallback = false;
+    let buffer = "", eventName = null, bytes = 0, pendingRead = null, detected = null;
+    let timer;
+    const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), CODEX_SSE_PEEK_TIMEOUT_MS); });
+    const inspect = (line) => {
+      line = line.trim();
+      if (!line) { eventName = null; return false; }
+      if (line.startsWith("event:")) { eventName = line.slice(6).trim(); return false; }
+      if (!line.startsWith("data:")) return false;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") return true;
+      let data;
+      try { data = JSON.parse(payload); } catch { return false; }
+      if (!data || typeof data !== "object") return false;
+      detected = classifySseError(eventName, data);
+      return !!detected || CODEX_SSE_OUTPUT_EVENTS.has(data.type || eventName);
+    };
     try {
-      while (text.length < CODEX_SSE_PEEK_BYTES) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        text += decoder.decode(value, { stream: true });
-        const lowerText = text.toLowerCase();
-        const accountHit = CODEX_SSE_ACCOUNT_FALLBACK_PATTERNS.find(p => lowerText.includes(p));
-        if (accountHit) { matched = accountHit; accountFallback = true; break; }
-        const retryHit = CODEX_SSE_RETRY_PATTERNS.find(p => lowerText.includes(p));
-        if (retryHit) { matched = retryHit; break; }
-        if (CODEX_SSE_USER_OUTPUT_PATTERNS.some(p => lowerText.includes(p))) break;
+      let stop = false;
+      while (!stop && bytes < CODEX_SSE_PEEK_BYTES) {
+        pendingRead = reader.read();
+        const next = await Promise.race([pendingRead, deadline]);
+        if (!next) break; // Keep the pending read: replay must not lose its bytes.
+        pendingRead = null;
+        if (next.done) { inspect(buffer + decoder.decode()); break; }
+        chunks.push(next.value);
+        bytes += next.value.byteLength;
+        buffer += decoder.decode(next.value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) { if (inspect(line)) { stop = true; break; } }
       }
-    } catch (e) {
-      dbg("CODEX", `peek read error: ${e.message}`);
+    } catch (error) {
+      reader.cancel(error).catch(() => {});
+      reader.releaseLock();
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
-
-    if (matched) {
-      try { await reader.cancel(); } catch { /* noop */ }
-      try { reader.releaseLock(); } catch { /* noop */ }
-      return { matched, message: extractSseErrorMessage(text, matched), accountFallback, replacementBody: null };
+    if (detected) {
+      reader.cancel().catch(() => {});
+      reader.releaseLock();
+      return detected;
     }
-
-    reader.releaseLock();
-
-    // Re-assemble stream: prefix chunks + remaining upstream body
-    const upstream = response.body;
-    let upstreamReader = null;
     const replacementBody = new ReadableStream({
       start(controller) {
-        for (const c of chunks) controller.enqueue(c);
-        upstreamReader = upstream.getReader();
+        for (const chunk of chunks) controller.enqueue(chunk);
       },
       async pull(controller) {
         try {
-          const { done, value } = await upstreamReader.read();
-          if (done) { controller.close(); return; }
-          controller.enqueue(value);
-        } catch (e) { controller.error(e); }
+          const next = await (pendingRead || reader.read());
+          pendingRead = null;
+          if (next.done) { reader.releaseLock(); controller.close(); }
+          else controller.enqueue(next.value);
+        } catch (error) { reader.releaseLock(); controller.error(error); }
       },
-      cancel(reason) {
-        try { upstreamReader?.cancel(reason); } catch { /* noop */ }
+      async cancel(reason) {
+        try { await reader.cancel(reason); } finally { reader.releaseLock(); }
       },
     });
-    return { matched: null, message: null, accountFallback: false, replacementBody };
+    return { ...noError, replacementBody };
   }
 
   // Parse Codex usage_limit_reached to extract precise resetsAtMs; fallback to default otherwise

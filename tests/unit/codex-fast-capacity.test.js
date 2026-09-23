@@ -52,6 +52,25 @@ describe("Codex fast tier and capacity handling", () => {
     expect(peek.message).toBe("Selected model is at capacity. Please try a different model.");
   });
 
+  it("does not classify generated overload text as a service failure", async () => {
+    const text = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"server_is_overloaded service_unavailable_error selected model is at capacity"}\n\n';
+    const peek = await new CodexExecutor()._peekSseTransientError(new Response(streamFromText(text)));
+    expect(peek.matched).toBeNull();
+    expect(await new Response(peek.replacementBody).text()).toBe(text);
+  });
+
+  it("bounds the peek without dropping a pending read", async () => {
+    let source;
+    const upstream = new ReadableStream({ start(controller) { source = controller; } });
+    const started = Date.now();
+    const peek = await new CodexExecutor()._peekSseTransientError(new Response(upstream));
+    expect(Date.now() - started).toBeLessThan(2500);
+    expect(peek.matched).toBeNull();
+    source.enqueue(new TextEncoder().encode("data: late bytes\n\n"));
+    source.close();
+    expect(await new Response(peek.replacementBody).text()).toBe("data: late bytes\n\n");
+  });
+
   it("reassembles normal SSE after peeking", async () => {
     const executor = new CodexExecutor();
     const text = [
@@ -72,6 +91,7 @@ describe("Codex fast tier and capacity handling", () => {
 
 describe("Codex reasoning normalization", () => {
   it.each([
+    ["gpt-6-astra", "max", "max"],
     ["gpt-5.6-sol", "max", "max"],
     ["gpt-5.6-sol", "ultra", "ultra"],
     ["gpt-5.6-terra", "max", "max"],

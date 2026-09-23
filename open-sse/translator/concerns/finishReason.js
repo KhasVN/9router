@@ -11,6 +11,10 @@ export function toOpenAIFinish(reason, format) {
         case CLAUDE_STOP.MAX_TOKENS: return OPENAI_FINISH.LENGTH;
         case CLAUDE_STOP.TOOL_USE: return OPENAI_FINISH.TOOL_CALLS;
         case CLAUDE_STOP.STOP_SEQUENCE: return OPENAI_FINISH.STOP;
+        // A refusal is a blocked turn, not a clean stop: with the default mapping an
+        // OpenAI client saw finish_reason "stop" and an empty message (9Router logged
+        // "succeeded", OUT 0) and could not tell it from a real answer.
+        case CLAUDE_STOP.REFUSAL: return OPENAI_FINISH.CONTENT_FILTER;
         default: return OPENAI_FINISH.STOP;
       }
     case "commandcode":
@@ -54,6 +58,19 @@ export function toOpenAIFinish(reason, format) {
   }
 }
 
+export function toResponsesFinish(reason) {
+  if (reason === OPENAI_FINISH.LENGTH || reason === OPENAI_FINISH.CONTENT_FILTER) {
+    return {
+      status: "incomplete",
+      incomplete_details: { reason: reason === OPENAI_FINISH.LENGTH ? "max_output_tokens" : "content_filter" },
+    };
+  }
+  if (reason === OPENAI_FINISH.STOP || reason === OPENAI_FINISH.TOOL_CALLS || reason === "function_call") {
+    return { status: "completed" };
+  }
+  throw new Error(`Unsupported upstream finish_reason: ${reason}`);
+}
+
 // OpenAI finish_reason → upstream stop reason
 export function fromOpenAIFinish(reason, format) {
   switch (format) {
@@ -62,6 +79,7 @@ export function fromOpenAIFinish(reason, format) {
         case OPENAI_FINISH.STOP: return CLAUDE_STOP.END_TURN;
         case OPENAI_FINISH.LENGTH: return CLAUDE_STOP.MAX_TOKENS;
         case OPENAI_FINISH.TOOL_CALLS: return CLAUDE_STOP.TOOL_USE;
+        case OPENAI_FINISH.CONTENT_FILTER: return CLAUDE_STOP.REFUSAL;
         default: return CLAUDE_STOP.END_TURN;
       }
     default:

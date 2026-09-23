@@ -26,8 +26,8 @@ if (mode === "fixture") {
       const body = JSON.parse(raw);
       const target = req.headers["x-relay-target"];
       const path = req.headers["x-relay-path"];
-      assert(["https://api.commandcode.ai", "https://chatgpt.com"].includes(target));
-      assert(["/alpha/generate", "/backend-api/codex/responses"].includes(path));
+      assert(["https://api.commandcode.ai", "https://chatgpt.com", "https://opencode.ai"].includes(target));
+      assert(["/alpha/generate", "/backend-api/codex/responses", "/zen/go/v1/responses", "/zen/v1/responses"].includes(path));
       const command = target.includes("commandcode");
       assert.equal(command ? body.params.stream : body.stream, true);
       const model = command ? body.params.model : body.model;
@@ -62,10 +62,22 @@ if (mode === "fixture") {
         ? [{ type: "response.failed", response: { status: "failed", error: { message: "Fixture failure" } } }]
         : [
           { type: "response.created", response: { id: "resp_fixture", model, status: "in_progress", created_at: 1700000000 } },
-          ...output.map((item, output_index) => ({ type: "response.output_item.done", output_index, item })),
-          ...(!truncated ? [{ type: "response.completed", response: { id: "resp_fixture", model, status: "completed", output, usage: { input_tokens: 12, output_tokens: 7, total_tokens: 19 } } }] : []),
+          ...output.flatMap((item, output_index) => [
+            { type: "response.output_item.added", output_index, item: { ...item, arguments: "" } },
+            item.type === "function_call"
+              ? { type: "response.function_call_arguments.delta", item_id: item.id, output_index, delta: item.arguments }
+              : { type: "response.output_text.delta", item_id: item.id, output_index, content_index: 0, delta: item.content[0].text },
+            { type: "response.output_item.done", output_index, item },
+          ]),
+          ...(midstreamError ? [error] : !truncated ? [{ type: "response.completed", response: { id: "resp_fixture", model, status: "completed", output, usage: { input_tokens: 12, output_tokens: 7, total_tokens: 19 } } }] : []),
         ];
       res.setHeader("Content-Type", "text/event-stream");
+      if (req.url === "/idle") {
+        assert.equal(body.model, "gpt-6-astra");
+        assert.equal(body.reasoning.effort, "max");
+        res.flushHeaders();
+        await sleep(130000);
+      }
       // One write intentionally packs all events into the executor's first read.
       res.end(command
         ? ndjson.map(event => JSON.stringify(event)).join("\n") + "\n"
@@ -120,6 +132,10 @@ if (mode === "fixture") {
     const cmc = (await admin("/api/providers", {
       provider: "commandcode", apiKey: "user_fixture_not_real", name: "fixture", proxyPoolId: pool.id,
     })).connection;
+    const ocg = (await admin("/api/providers", {
+      provider: "opencode-go", apiKey: "fixture-not-real", name: "fixture", proxyPoolId: pool.id,
+    })).connection;
+    await admin("/api/settings", { providerStrategies: { opencode: { proxyPoolId: pool.id } } }, "PATCH");
     const imported = await admin("/api/oauth/codex/bulk-import", [{
       name: "fixture", email: "fixture@example.invalid", accessToken: "fixture-not-real",
       expiresAt: new Date(Date.now() + 864000000).toISOString(),
@@ -130,26 +146,49 @@ if (mode === "fixture") {
     const alias = "claude-haiku-4-5-20251001";
     await admin("/api/combos", { name: alias, models: ["cmc/fixture-model"] });
     const properties = { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] };
-    async function invoke(path, model, stream, expected = 200, extra = {}) {
+    async function invoke(path, model, stream, expected = 200, extra = {}, expectStreamFailure = false) {
       const responses = path.endsWith("responses");
       const body = responses
         ? { model, stream, input: [{ role: "user", content: "Read fixture" }], tools: [{ type: "function", name: "Read", parameters: properties }] }
         : { model, stream, max_tokens: 128, messages: [{ role: "user", content: "Read fixture" }], tools: [{ name: "Read", input_schema: properties }] };
+      const idle = model === "cx/gpt-6-astra";
+      const started = Date.now();
       const response = await fetch(base + path, {
         method: "POST", headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ ...body, ...extra }), signal: AbortSignal.timeout(30000),
+        body: JSON.stringify({ ...body, ...extra }), signal: AbortSignal.timeout(idle ? 150000 : 30000),
       });
-      const wire = await response.text();
+      let wire = "";
+      if (idle) {
+        const decoder = new TextDecoder();
+        let last = started;
+        let reads = 0;
+        for await (const chunk of response.body) {
+          const now = Date.now();
+          assert(now - last < (reads === 0 ? 5000 : 25000), "Downstream stalled despite heartbeat");
+          last = now;
+          reads++;
+          wire += decoder.decode(chunk, { stream: true });
+        }
+        wire += decoder.decode();
+        assert(Date.now() - started >= 130000, "Idle fixture ended early");
+        assert(wire.split(": keepalive").length >= 9, "Missing periodic heartbeat comments");
+        assert.match(response.headers.get("cache-control"), /no-transform/);
+        console.log(`PASS ${path} Astra max effort: 130s upstream silence with downstream heartbeat`);
+      } else {
+        wire = await response.text();
+      }
       assert.equal(response.status, expected, `${path} ${model}: ${wire.slice(0,500)}`);
       if (expected !== 200) {
-        assert.match(JSON.parse(wire).error.message, /Upstream (SSE stream ended before a finish reason|Responses stream did not complete successfully)|Failed to convert streaming response to JSON/);
+        assert.match(JSON.parse(wire).error.message, model.includes("fixture-failed")
+          ? /\[502\].*Fixture failure/
+          : /Upstream (SSE stream ended before a finish reason|Responses stream did not complete successfully)|Failed to convert streaming response to JSON/);
         return;
       }
       if (stream) {
         assert.match(response.headers.get("content-type"), /text\/event-stream/);
         const events = wire.split(/\r?\n/).filter(l => l.startsWith("data:") && l.slice(5).trim() !== "[DONE]").map(l => JSON.parse(l.slice(5)));
-        if (model.includes("fixture-error")) {
-          assert(events.some(e => e.error), "Packed upstream error disappeared");
+        if (expectStreamFailure || model.includes("fixture-error")) {
+          assert(events.some(e => e.error || e.type === "response.failed"), "Upstream failure disappeared");
           assert(!events.some(e => e.type === "message_stop" || e.type === "response.completed"), "Upstream error became a successful turn");
           console.log(`PASS ${path} rejects packed midstream error`);
           return;
@@ -199,6 +238,26 @@ if (mode === "fixture") {
       await invoke("/v1/messages", `${provider}/fixture-${route}-json`, false, 503);
       console.log(`PASS rejects ${provider} ${route} upstream`);
     }
+    const museModels = ["ocg/muse-spark-1.3-contributor", "oc/muse-spark-1.3-contributor-free"];
+    for (const model of museModels) {
+      for (const path of ["/v1/messages", "/v1/responses"]) {
+        for (const stream of [true, false]) await invoke(path, model, stream);
+      }
+    }
+    for (const route of ["error", "truncated", "failed"]) {
+      const badPool = (await admin("/api/proxy-pools", { name: `muse-${route}`, type: "vercel", proxyUrl: `http://fixture:8080/${route}` })).proxyPool;
+      await admin(`/api/providers/${ocg.id}`, { proxyPoolId: badPool.id }, "PUT");
+      await admin("/api/settings", { providerStrategies: { opencode: { proxyPoolId: badPool.id } } }, "PATCH");
+      for (const model of museModels) {
+        for (const path of ["/v1/messages", "/v1/responses"]) await invoke(path, model, true, 200, {}, true);
+      }
+    }
+    const idlePool = (await admin("/api/proxy-pools", { name: "astra-idle", type: "vercel", proxyUrl: "http://fixture:8080/idle" })).proxyPool;
+    await admin(`/api/providers/${codex.id}`, { proxyPoolId: idlePool.id }, "PUT");
+    await Promise.all([
+      invoke("/v1/messages", "cx/gpt-6-astra", true, 200, { output_config: { effort: "max" } }),
+      invoke("/v1/responses", "cx/gpt-6-astra", true, 200, { reasoning: { effort: "max" } }),
+    ]);
     const seen = await (await fetch("http://fixture:8080/seen")).json();
     assert.equal(seen.filter(r => r.model === "fixture-retry").length, 2, "Transient failure must retry once");
     assert(seen.some(r => r.model === "fixture-vision"), "Image and effort did not reach upstream");
@@ -217,7 +276,7 @@ if (mode === "fixture") {
   const mount = `type=bind,src=${fileURLToPath(import.meta.url)},dst=/smoke.mjs,readonly`;
   const env = { ...process.env, SMOKE_PASSWORD: randomUUID(), INITIAL_PASSWORD: "", MSYS_NO_PATHCONV: "1" };
   env.INITIAL_PASSWORD = env.SMOKE_PASSWORD;
-  const docker = (...args) => execFileSync("docker", args, { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 180000 });
+  const docker = (...args) => execFileSync("docker", args, { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 240000 });
   const created = [];
   function startGateway() {
     docker("run", "-d", "--name", gateway, "--network", name, "--network-alias", "gateway", "--mount", `type=volume,src=${volume},dst=/app/data`, "-e", "INITIAL_PASSWORD", image);

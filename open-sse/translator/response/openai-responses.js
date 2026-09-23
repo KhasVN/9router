@@ -8,19 +8,54 @@ import { buildChunk } from "../concerns/chunk.js";
 import { buildUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
 import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
+import { toResponsesFinish } from "../concerns/finishReason.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
 
 /**
  * Translate OpenAI chunk to Responses API events
  * @returns {Array} Array of events with { event, data } structure
  */
+// Upstream Chat Completions usage -> Responses API usage shape.
+// Without this, /v1/responses never reports usage: Responses clients (Codex CLI)
+// keep their "context used" gauge pinned at 0 and never auto-compact, so a long
+// session grows until the upstream context limit rejects it (9router issue #3432).
+//
+// Note this is stored under state.responsesUsage, NOT state.usage: state.usage is
+// owned by the stream layer, which fills it with normalizeUsage()-shaped counts
+// (prompt_tokens/prompt_tokens_details) and hands it to finalizeStream() for
+// logging and cost accounting. Overwriting it with this shape silently drops
+// cached/reasoning tokens from those stats.
+function toResponsesUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+
+  const inputTokens = [usage.input_tokens, usage.prompt_tokens].find(Number.isFinite) ?? 0;
+  const outputTokens = [usage.output_tokens, usage.completion_tokens].find(Number.isFinite) ?? 0;
+  const responseUsage = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: Number.isFinite(usage.total_tokens) ? usage.total_tokens : inputTokens + outputTokens
+  };
+  const cachedTokens = [usage.input_tokens_details?.cached_tokens, usage.prompt_tokens_details?.cached_tokens].find(Number.isFinite);
+  const reasoningTokens = [usage.output_tokens_details?.reasoning_tokens, usage.completion_tokens_details?.reasoning_tokens].find(Number.isFinite);
+  if (Number.isFinite(cachedTokens)) responseUsage.input_tokens_details = { cached_tokens: cachedTokens };
+  if (Number.isFinite(reasoningTokens)) responseUsage.output_tokens_details = { reasoning_tokens: reasoningTokens };
+
+  return responseUsage;
+}
+
 export function openaiToOpenAIResponsesResponse(chunk, state) {
   if (!chunk) {
     return flushEvents(state);
   }
-  
+
+  // Capture upstream usage BEFORE the choices guard below: the last OpenAI chunk
+  // may carry usage together with an empty choices array, and it must not be dropped.
+  if (chunk.usage) {
+    state.responsesUsage = toResponsesUsage(chunk.usage);
+  }
+
   if (!chunk.choices?.length) return [];
-  
+
   const events = [];
   const nextSeq = () => ++state.seq;
   
@@ -112,7 +147,13 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
     for (const i in state.msgItemAdded) closeMessage(state, emit, i);
     closeReasoning(state, emit);
     for (const i in state.funcCallIds) closeToolCall(state, emit, i);
-    sendCompleted(state, emit);
+    // Defer direct-route completion until trailing usage chunk is captured.
+    // Pivot routes do not reach flushEvents(), so they complete immediately.
+    state.responsesFinishReason = choice.finish_reason;
+    const flushReachesUs = state.targetFormat === FORMATS.OPENAI;
+    if (state.responsesUsage || !flushReachesUs) {
+      sendCompleted(state, emit, state.responsesFinishReason);
+    }
   }
 
   return events;
@@ -365,18 +406,20 @@ function closeToolCall(state, emit, idx) {
   }
 }
 
-function sendCompleted(state, emit) {
+function sendCompleted(state, emit, finishReason) {
   if (!state.completedSent) {
+    const terminal = toResponsesFinish(finishReason);
     state.completedSent = true;
-    emit("response.completed", {
-      type: "response.completed",
+    emit(`response.${terminal.status}`, {
+      type: `response.${terminal.status}`,
       response: {
         id: state.responseId,
         object: "response",
         created_at: state.created,
-        status: "completed",
+        ...terminal,
         background: false,
-        error: null
+        error: null,
+        ...(state.responsesUsage ? { usage: state.responsesUsage } : {})
       }
     });
   }
@@ -384,28 +427,110 @@ function sendCompleted(state, emit) {
 
 function flushEvents(state) {
   if (state.completedSent) return [];
-  
+
+  // EOF is not a finish_reason. Complete only after authoritative upstream
+  // finish_reason was seen; otherwise preserve truncated-stream failure.
+  if (!state.responsesFinishReason) {
+    throw new Error("stream closed before upstream finish_reason");
+  }
+
   const events = [];
   const nextSeq = () => ++state.seq;
   const emit = (eventType, data) => {
     data.sequence_number = nextSeq();
     events.push({ event: eventType, data });
   };
-
   for (const i in state.msgItemAdded) closeMessage(state, emit, i);
   closeReasoning(state, emit);
   for (const i in state.funcCallIds) closeToolCall(state, emit, i);
-  sendCompleted(state, emit);
-  
+  sendCompleted(state, emit, state.responsesFinishReason);
   return events;
 }
 
 // currentToolCallId is intentionally sticky for the current turn so flush/completion
-  // can still finalize as tool_calls even if the tool call was emitted before stream end.
+// can still finalize as tool_calls even if the tool call was emitted before stream end.
 function computeFinishReason(state) {
-   return state.toolCallIndex > 0 || state.currentToolCallId
+  return state.toolCallIndex > 0 || state.currentToolCallId
     ? OPENAI_FINISH.TOOL_CALLS
     : OPENAI_FINISH.STOP;
+}
+
+const RESPONSES_FAILURE_STATUSES = new Set(["failed", "cancelled"]);
+const RESPONSES_INCOMPLETE_STATUSES = new Set(["incomplete"]);
+
+function getResponsesStatus(data) {
+  return data?.response?.status || data?.status || null;
+}
+
+function getResponsesIncompleteReason(data) {
+  return data?.response?.incomplete_details?.reason || data?.incomplete_details?.reason || null;
+}
+
+function getResponsesIncompleteFinishReason(data) {
+  const reason = getResponsesIncompleteReason(data);
+  if (["max_tokens", "max_output_tokens"].includes(reason)) return OPENAI_FINISH.LENGTH;
+  if (reason === "content_filter") return OPENAI_FINISH.CONTENT_FILTER;
+  return null;
+}
+
+function getResponsesFailureDetail(eventType, data, status) {
+  const error = data?.error || data?.response?.error;
+  if (typeof error === "string") return error;
+  if (error?.message) return error.message;
+  if (typeof data?.message === "string" && data.message) return data.message;
+  if (error) return JSON.stringify(error);
+  if (data?.code) return String(data.code);
+  if (status === "incomplete") {
+    const reason = getResponsesIncompleteReason(data);
+    return reason ? `response incomplete: ${reason}` : "response incomplete";
+  }
+  if (status) return status;
+  return eventType === "response.incomplete" ? "response incomplete" : "upstream response failed";
+}
+
+function throwResponsesFailure(state, eventType, data, status = getResponsesStatus(data)) {
+  const error = data?.error || data?.response?.error;
+  state.error = error || { message: getResponsesFailureDetail(eventType, data, status), status };
+  state.responsesTerminalSeen = true;
+  // Prevent a later null flush from fabricating finish_reason=stop.
+  state.finishReasonSent = true;
+  throw new Error(`[Responses error: ${getResponsesFailureDetail(eventType, data, status)}]`);
+}
+
+function isSuccessfulResponsesTerminal(eventType, data) {
+  const status = getResponsesStatus(data);
+  return (eventType === "response.completed" || eventType === "response.done")
+    && (!status || status === "completed");
+}
+
+function makeResponsesFinishChunk(state, finishReason) {
+  if (state.finishReasonSent) return null;
+  state.finishReasonSent = true;
+  state.finishReason = finishReason;
+
+  const finalChunk = buildChunk(
+    { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+    {},
+    finishReason
+  );
+  if (state.usage && typeof state.usage === "object") finalChunk.usage = state.usage;
+  return finalChunk;
+}
+
+function handleResponsesTerminal(state, eventType, data) {
+  const status = getResponsesStatus(data);
+  if (data?.error || data?.response?.error || RESPONSES_FAILURE_STATUSES.has(status)) {
+    throwResponsesFailure(state, eventType, data, status);
+  }
+  if (RESPONSES_INCOMPLETE_STATUSES.has(status) || eventType === "response.incomplete") {
+    const finishReason = getResponsesIncompleteFinishReason(data);
+    if (!finishReason) throwResponsesFailure(state, eventType, data, status || "incomplete");
+    return makeResponsesFinishChunk(state, finishReason);
+  }
+  if (!isSuccessfulResponsesTerminal(eventType, data)) {
+    throwResponsesFailure(state, eventType, data, status);
+  }
+  return makeResponsesFinishChunk(state, computeFinishReason(state));
 }
 
 /**
@@ -414,25 +539,8 @@ function computeFinishReason(state) {
  */
 export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (!chunk) {
-    // Flush: send final chunk with finish_reason
-    if (state.finishReasonSent || !state.started) return null;
-
-    const finishReason = computeFinishReason(state);
-
-    state.finishReasonSent = true;
-    state.finishReason = finishReason;
-
-    const finalChunk = buildChunk(
-      { id: state.chatId || `chatcmpl-${Date.now()}`, created: state.created || Math.floor(Date.now() / 1000), model: state.model || MODEL_FALLBACK },
-      {},
-      finishReason
-    );
-
-    if (state.usage && typeof state.usage === "object") {
-      finalChunk.usage = state.usage;
-    }
-
-    return finalChunk;
+    if (state.finishReasonSent) return null;
+    throwResponsesFailure(state, "error", { message: "stream closed before response.completed" });
   }
 
   // Handle different event types from Responses API
@@ -538,59 +646,35 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     return null;
   }
 
-  // Response completed
-  if (eventType === "response.completed" || eventType === "response.done") {
-    // Extract usage from response.completed event
+  // Response terminal events. response.done can represent failed, cancelled, or
+  // incomplete states, so never treat it as successful without status inspection.
+  if (eventType === "response.completed" || eventType === "response.done" || eventType === "response.incomplete") {
     const responseUsage = data.response?.usage;
     if (responseUsage && typeof responseUsage === "object") {
       const inputTokens = responseUsage.input_tokens || responseUsage.prompt_tokens || 0;
       const outputTokens = responseUsage.output_tokens || responseUsage.completion_tokens || 0;
-      // OpenAI Responses API: input_tokens already includes cached_tokens
-      // Cache info is in input_tokens_details.cached_tokens
       const cacheReadTokens = responseUsage.input_tokens_details?.cached_tokens || responseUsage.cache_read_input_tokens || 0;
-      
       state.usage = buildUsage({ promptTokens: inputTokens, completionTokens: outputTokens, totalTokens: inputTokens + outputTokens, cachedTokens: cacheReadTokens });
     }
-    
-    if (!state.finishReasonSent) {
-      const finishReason = computeFinishReason(state);
 
-      state.finishReasonSent = true;
-      state.finishReason = finishReason; // Mark for usage injection in stream.js
-      
-      const finalChunk = buildChunk(
-        { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
-        {},
-        finishReason
-      );
-
-      // Include usage in final chunk if available
-      if (state.usage && typeof state.usage === "object") {
-        finalChunk.usage = state.usage;
-      }
-      
-      return finalChunk;
-    }
-    return null;
+    state.responsesTerminalSeen = true;
+    return handleResponsesTerminal(state, eventType, data);
   }
 
-  // Error events from Responses API (e.g. model_not_found)
+  // Error events from Responses API (e.g. model_not_found). Never rewrite one as
+  // content plus finish_reason=stop; Claude would render that as message_stop.
   if (eventType === "error" || eventType === "response.failed") {
-    // Avoid emitting duplicate errors (error + response.failed arrive back-to-back)
-    if (state.finishReasonSent) return null;
+    // Avoid throwing twice when providers emit error + response.failed together.
+    if (state.error) return null;
+    throwResponsesFailure(state, eventType, data);
+  }
 
-    const error = data.error || data.response?.error;
-    state.error = error || { message: "upstream response failed" };
-    // Terminal: a later flush() must not synthesize a finish chunk for a failure.
-    state.finishReasonSent = true;
+  if (RESPONSES_FAILURE_STATUSES.has(getResponsesStatus(data))) {
+    throwResponsesFailure(state, eventType, data);
+  }
 
-    // Throw rather than rewriting the failure as content + finish_reason "stop".
-    // A client cannot tell that fabricated stop from a real one, and a Claude
-    // client renders it as a successful message_stop — the exact fake stopping
-    // token this guards against. The stream handler turns the rejected stream
-    // into an in-band error frame for whatever format the client speaks.
-    const detail = error ? (error.message || JSON.stringify(error)) : data.response?.status || "upstream response failed";
-    throw new Error(`[Responses error: ${detail}]`);
+  if (RESPONSES_INCOMPLETE_STATUSES.has(getResponsesStatus(data))) {
+    return handleResponsesTerminal(state, eventType, data);
   }
 
   // Reasoning summary delta → emit as reasoning_content for client thinking display

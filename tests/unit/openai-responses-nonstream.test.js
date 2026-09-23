@@ -7,7 +7,7 @@ vi.mock("@/lib/usageDb.js", () => ({
 }));
 
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
-const { translateNonStreamingResponse } = await import("../../open-sse/handlers/chatCore/nonStreamingHandler.js");
+const { translateNonStreamingResponse, handleNonStreamingResponse } = await import("../../open-sse/handlers/chatCore/nonStreamingHandler.js");
 const { handleForcedSSEToJson } = await import("../../open-sse/handlers/chatCore/sseToJsonHandler.js");
 
 // A chat.completion body as returned by a chat-native upstream (e.g. op-ericding)
@@ -78,6 +78,13 @@ describe("non-stream Chat upstream for a Responses-API client (op-ericding bug)"
     expect(msg.content[0].text).toBe("hello");
   });
 
+  it.each([["length", "max_output_tokens"], ["content_filter", "content_filter"]])("preserves %s as incomplete JSON", (finish_reason, reason) => {
+    const body = structuredClone(CHAT_TOOL_BODY);
+    body.choices[0].finish_reason = finish_reason;
+    expect(translateNonStreamingResponse(body, FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES))
+      .toMatchObject({ status: "incomplete", incomplete_details: { reason } });
+  });
+
   it("leaves chat->chat untouched", () => {
     const out = translateNonStreamingResponse(CHAT_TOOL_BODY, FORMATS.OPENAI, FORMATS.OPENAI);
     expect(out.object).toBe("chat.completion");
@@ -136,6 +143,68 @@ describe("forced-SSE JSON path for a Responses-API client behind a chat upstream
       name: "shell",
       input: "{\"cmd\":\"pwd\"}"
     });
+  });
+
+  it.each([["length", "max_output_tokens"], ["content_filter", "content_filter"]])("preserves %s in forced Chat SSE JSON", async (finish, reason) => {
+    const ctx = sseCtx(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI);
+    const wire = await ctx.providerResponse.text();
+    ctx.providerResponse = new Response(wire.replace('"finish_reason":"tool_calls"', `"finish_reason":"${finish}"`), { headers: { "content-type": "text/event-stream" } });
+    const result = await handleForcedSSEToJson(ctx);
+    expect(await result.response.json()).toMatchObject({ status: "incomplete", incomplete_details: { reason } });
+  });
+
+  it.each([
+    [FORMATS.CLAUDE, "max_output_tokens", "max_tokens"],
+    [FORMATS.CLAUDE, "content_filter", "refusal"],
+    [FORMATS.OPENAI, "max_output_tokens", "length"],
+    [FORMATS.OPENAI_RESPONSES, "max_output_tokens", "incomplete"],
+  ])("preserves incomplete Responses JSON for %s with %s", async (source, reason, expected) => {
+    const ctx = sseCtx(source, FORMATS.OPENAI_RESPONSES);
+    ctx.providerResponse = new Response(`event: response.incomplete\ndata: ${JSON.stringify({ response: { status: "incomplete", incomplete_details: { reason }, output: [] } })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+    const result = await handleForcedSSEToJson(ctx);
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.stop_reason || json.choices?.[0]?.finish_reason || json.status).toBe(expected);
+  });
+
+  it.each([FORMATS.CLAUDE, FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES])("handles Muse Responses SSE for non-stream %s clients", async (source) => {
+    const ctx = sseCtx(source, FORMATS.OPENAI_RESPONSES);
+    ctx.provider = "opencode-go";
+    const response = {
+      id: "resp_muse", status: "completed",
+      output: [{ type: "function_call", id: "fc_9", call_id: "call_9", name: "shell", arguments: '{"cmd":"pwd"}' }],
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+    };
+    ctx.providerResponse = new Response(`event: response.completed\ndata: ${JSON.stringify({ response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+    const result = await handleNonStreamingResponse(ctx);
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    if (source === FORMATS.CLAUDE) {
+      expect(json.stop_reason).toBe("tool_use");
+      expect(json.content[0].input).toEqual({ cmd: "pwd" });
+    } else if (source === FORMATS.OPENAI) {
+      expect(json.choices[0].finish_reason).toBe("tool_calls");
+      expect(json.choices[0].message.tool_calls[0].function.arguments).toBe('{"cmd":"pwd"}');
+    } else {
+      expect(json.status).toBe("completed");
+      expect(json.output[0].arguments).toBe('{"cmd":"pwd"}');
+    }
+    expect(ctx.trackDone).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["failed", "truncated"])("rejects %s Muse SSE for non-stream clients", async (status) => {
+    const ctx = sseCtx(FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES);
+    ctx.provider = "opencode-go";
+    const event = status === "failed"
+      ? { type: "response.failed", response: { status: "failed", error: { message: "fixture failure" } } }
+      : { type: "response.created", response: { status: "in_progress" } };
+    ctx.providerResponse = new Response(`data: ${JSON.stringify(event)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+    ctx.onRequestSuccess = vi.fn();
+    const result = await handleNonStreamingResponse(ctx);
+    expect(result.success).toBe(false);
+    expect(result.response.status).toBe(502);
+    expect(ctx.onRequestSuccess).not.toHaveBeenCalled();
+    expect(ctx.trackDone).toHaveBeenCalledTimes(1);
   });
 
   it("still returns chat.completion for a plain chat client", async () => {

@@ -25,7 +25,7 @@ logs
 !**/.env.example
 .claude
 .github
-.temp
+.temp*
 *.log
 
 # Debug logs

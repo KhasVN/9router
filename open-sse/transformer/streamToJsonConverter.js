@@ -4,61 +4,113 @@
  * Used when client requests non-streaming but provider forces streaming (e.g., Codex)
  */
 
+const EMPTY_RESPONSE = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+
+function asError(value, fallback = "upstream response failed") {
+  if (typeof value === "string" && value) return { message: value };
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  return { message: fallback };
+}
+
+function applyUsage(state, payload) {
+  const usage = payload?.response?.usage || payload?.usage;
+  if (!usage || typeof usage !== "object") return;
+  state.usage = { ...state.usage, ...usage };
+}
+
 /**
- * Process a single SSE message and update state accordingly.
+ * Process one complete SSE event block.
  */
 function processSSEMessage(msg, state) {
-  if (!msg.trim()) return;
+  if (state.terminalSeen || !msg.trim()) return;
 
-  const eventMatch = msg.match(/^event:\s*(.+)$/m);
-  const dataMatch = msg.match(/^data:\s*(.+)$/m);
-  if (!eventMatch || !dataMatch) return;
+  let eventType = null;
+  const dataLines = [];
+  for (const line of msg.split(/\r?\n/)) {
+    if (line.startsWith("event:")) eventType = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (dataLines.length === 0) return;
 
-  const eventType = eventMatch[1].trim();
-  const dataStr = dataMatch[1].trim();
+  const dataStr = dataLines.join("\n").trim();
   if (dataStr === "[DONE]") return;
 
   let parsed;
   try { parsed = JSON.parse(dataStr); }
   catch { return; }
 
-  if (eventType === "response.created") {
-    state.responseId = parsed.response?.id || state.responseId;
-    state.created = parsed.response?.created_at || state.created;
-  } else if (eventType === "response.output_item.done") {
-    state.items.set(parsed.output_index ?? 0, parsed.item);
-  } else if (eventType === "response.completed" || eventType === "response.done") {
-    state.status = "completed";
-    if (parsed.response?.usage) {
-      state.usage.input_tokens = parsed.response.usage.input_tokens || 0;
-      state.usage.output_tokens = parsed.response.usage.output_tokens || 0;
-      state.usage.total_tokens = parsed.response.usage.total_tokens || 0;
-    }
-  } else if (eventType === "response.failed") {
-    state.status = "failed";
+  const type = eventType || parsed.type;
+  const response = parsed.response && typeof parsed.response === "object" ? parsed.response : parsed;
+  const status = response?.status || parsed.status;
+
+  if (type === "response.created") {
+    state.responseId = response.id || state.responseId;
+    state.created = response.created_at || state.created;
+  }
+
+  if (type === "response.output_item.done" && response.item) {
+    state.items.set(parsed.output_index ?? state.items.size, response.item);
+  }
+
+  if (Array.isArray(response?.output)) {
+    for (const [index, item] of response.output.entries()) state.items.set(index, item);
+  }
+
+  applyUsage(state, parsed);
+
+  const errorValue = parsed.error || response?.error;
+  if (type === "error" || type === "response.failed" || status === "failed" || status === "cancelled" || errorValue) {
+    state.status = status === "cancelled" || type === "response.cancelled" ? "cancelled" : "failed";
+    state.error = asError(errorValue, status === "cancelled" ? "upstream response cancelled" : "upstream response failed");
+    state.terminalSeen = true;
+    return;
+  }
+
+  if (type === "response.incomplete" || status === "incomplete") {
+    state.status = "incomplete";
+    state.incompleteDetails = response.incomplete_details || parsed.incomplete_details || null;
+    state.terminalSeen = true;
+    return;
+  }
+
+  if (type === "response.completed" || type === "response.done") {
+    state.status = status || "completed";
+    state.terminalSeen = true;
   }
 }
 
-const EMPTY_RESPONSE = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+function buildOutput(state) {
+  const output = [];
+  const maxIndex = state.items.size > 0 ? Math.max(...state.items.keys()) : -1;
+  for (let i = 0; i <= maxIndex; i++) {
+    output.push(state.items.get(i) || { type: "message", content: [], role: "assistant" });
+  }
+  return output;
+}
 
 /**
- * Convert Responses API SSE stream to single JSON response
- * @param {ReadableStream} stream - SSE stream from provider
- * @returns {Promise<Object>} Final JSON response in Responses API format
+ * Convert Responses API SSE stream to single JSON response.
+ * Failed, cancelled, incomplete, and truncated streams stay non-successful;
+ * no EOF path is allowed to become status=completed.
  */
 export async function convertResponsesStreamToJson(stream) {
   if (!stream || typeof stream.getReader !== "function") {
-    return { id: `resp_${Date.now()}`, object: "response", created_at: Math.floor(Date.now() / 1000), status: "failed", output: [], usage: { ...EMPTY_RESPONSE } };
+    return {
+      id: `resp_${Date.now()}`, object: "response", created_at: Math.floor(Date.now() / 1000),
+      status: "failed", output: [], usage: { ...EMPTY_RESPONSE }, error: { message: "missing Responses stream" }
+    };
   }
 
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-
   const state = {
     responseId: "",
     created: Math.floor(Date.now() / 1000),
     status: "in_progress",
+    terminalSeen: false,
+    error: null,
+    incompleteDetails: null,
     usage: { ...EMPTY_RESPONSE },
     items: new Map()
   };
@@ -67,37 +119,34 @@ export async function convertResponsesStreamToJson(stream) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
-      const messages = buffer.split("\n\n");
+      const messages = buffer.split(/\r?\n\r?\n/);
       buffer = messages.pop() || "";
-
-      for (const msg of messages) {
-        processSSEMessage(msg, state);
-      }
+      for (const msg of messages) processSSEMessage(msg, state);
     }
-
-    // Flush remaining buffer (last event may not end with \n\n)
-    if (buffer.trim()) {
-      processSSEMessage(buffer, state);
-    }
+    buffer += decoder.decode();
+    if (buffer.trim()) processSSEMessage(buffer, state);
+  } catch (error) {
+    state.status = "failed";
+    state.error = asError(error?.message, "Responses stream read failed");
   } finally {
     reader.releaseLock();
   }
 
-  // Build output array from accumulated items (ordered by index)
-  const output = [];
-  const maxIndex = state.items.size > 0 ? Math.max(...state.items.keys()) : -1;
-  for (let i = 0; i <= maxIndex; i++) {
-    output.push(state.items.get(i) || { type: "message", content: [], role: "assistant" });
+  if (!state.terminalSeen && state.status === "in_progress") {
+    state.status = "failed";
+    state.error = { message: "stream closed before response.completed" };
   }
 
-  return {
+  const result = {
     id: state.responseId || `resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     object: "response",
     created_at: state.created,
-    status: state.status || "completed",
-    output,
-    usage: state.usage
+    status: state.status,
+    output: buildOutput(state),
+    usage: state.usage,
+    error: state.error
   };
+  if (state.incompleteDetails) result.incomplete_details = state.incompleteDetails;
+  return result;
 }

@@ -6,6 +6,7 @@
 
 import fs from "fs";
 import path from "path";
+import { toResponsesFinish } from "../translator/concerns/finishReason.js";
 
 // Create log directory for responses (Node.js only)
 export function createResponsesLogger(model, logsDir = null) {
@@ -222,16 +223,17 @@ export function createResponsesApiTransformStream(logger = null) {
     }
   };
 
-  const sendCompleted = (controller) => {
+  const sendCompleted = (controller, finishReason) => {
     if (!state.completedSent) {
+      const terminal = toResponsesFinish(finishReason);
       state.completedSent = true;
-      emit(controller, "response.completed", {
-        type: "response.completed",
+      emit(controller, `response.${terminal.status}`, {
+        type: `response.${terminal.status}`,
         response: {
           id: state.responseId,
           object: "response",
           created_at: state.created,
-          status: "completed",
+          ...terminal,
           background: false,
           error: null
         }
@@ -419,16 +421,17 @@ export function createResponsesApiTransformStream(logger = null) {
           for (const i in state.msgItemAdded) closeMessage(controller, i);
           closeReasoning(controller);
           for (const i in state.funcCallIds) closeToolCall(controller, i);
-          sendCompleted(controller);
+          sendCompleted(controller, choice.finish_reason);
         }
       }
     },
 
     flush(controller) {
-      for (const i in state.msgItemAdded) closeMessage(controller, i);
-      closeReasoning(controller);
-      for (const i in state.funcCallIds) closeToolCall(controller, i);
-      sendCompleted(controller);
+      // Chat [DONE]/EOF without finish_reason is truncated upstream output.
+      // Never turn it into response.completed.
+      if (!state.completedSent) {
+        throw new Error("stream closed before upstream finish_reason");
+      }
 
       logger?.logOutput("data: [DONE]");
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));

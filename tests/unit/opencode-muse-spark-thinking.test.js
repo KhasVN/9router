@@ -214,8 +214,9 @@ describe("OpenCode Free Muse Spark thinking", () => {
     // User message, function_call, function_call_output, and next user message survive
     const types = out.input.map((item) => item.type);
     expect(types).toEqual(["message", "function_call", "function_call_output", "message"]);
-    // Tools flattened and empty properties added
-    expect(out.tools).toEqual([
+    // Client tool flattened; upstream-required fingerprint tools appended.
+    expect(out.tools.map((tool) => tool.name)).toEqual(["shell", "bash", "glob", "grep", "read"]);
+    expect(out.tools.slice(0, 1)).toEqual([
       {
         type: "function",
         name: "shell",

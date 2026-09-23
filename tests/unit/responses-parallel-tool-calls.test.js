@@ -41,7 +41,7 @@ function accumulate(calls, chunks) {
 function runStream(events) {
   const state = {};
   const chunks = [];
-  for (const ev of events) {
+  for (const ev of [...events, { type: "response.completed", response: { status: "completed" } }]) {
     const out = openaiResponsesToOpenAIResponse(ev, state);
     if (out) chunks.push(out);
   }
@@ -121,7 +121,7 @@ describe("responses → claude end-to-end keeps parallel tool_use blocks separat
   it("four read_file calls arrive as four parseable tool_use blocks", () => {
     const state = initState(FORMATS.CLAUDE);
     const out = [];
-    for (const ev of hostileOrdering()) {
+    for (const ev of [...hostileOrdering(), { type: "response.completed", response: { status: "completed" } }]) {
       for (const r of translateResponse(FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE, ev, state)) out.push(r);
     }
     for (const r of translateResponse(FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE, null, state)) out.push(r);

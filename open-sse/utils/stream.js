@@ -60,7 +60,13 @@ export function createSSEStream(options = {}) {
   const decoder = new TextDecoder("utf-8", { fatal: false });
 
   const state = mode === STREAM_MODE.TRANSLATE
-    ? { ...initState(sourceFormat), provider, toolNameMap, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null }
+    ? { ...initState(sourceFormat), provider, toolNameMap, customToolNames: new Set(customToolNames || []), model, sessionId: credentials?._clientSessionId || null,
+        // Which upstream format this stream came from. A response translator can be
+        // reached either directly (target === its registered source) or as the second
+        // hop of a pivot, and on the terminal null chunk the pivot drops it — so a
+        // translator that defers closing events until flush needs to know which case
+        // it is in. Absent/undefined means "unknown", i.e. do not defer.
+        targetFormat }
     : null;
 
   let totalContentLength = 0;
@@ -332,6 +338,9 @@ export function createSSEStream(options = {}) {
           continue;
         }
 
+        if (isOpenAIResponsesStream && openAIResponsesEventName && !parsed.type) {
+          parsed.type = openAIResponsesEventName;
+        }
         currentOpenAIResponsesEvent = null;
 
         // Translate: targetFormat -> openai -> sourceFormat
@@ -413,6 +422,11 @@ export function createSSEStream(options = {}) {
           // accepts "data: " lines, so an NDJSON provider (Ollama) lost whatever
           // arrived without its closing newline.
           const parsed = parseSSELine(buffer.trim(), targetFormat);
+          if (parsed && targetFormat === FORMATS.OPENAI_RESPONSES) {
+            const eventName = getOpenAIResponsesEventName(currentOpenAIResponsesEvent, parsed);
+            if (isOpenAIResponsesTerminalEvent(eventName, parsed)) openAIResponsesTerminalSeen = true;
+            if (eventName && !parsed.type && !parsed.done) parsed.type = eventName;
+          }
           // parseSSELine turns the SSE sentinel "data: [DONE]" into { done: true },
           // which must not be translated. An Ollama chunk also carries done:true,
           // but it is the real final chunk — it holds finish_reason and the token
@@ -424,7 +438,9 @@ export function createSSEStream(options = {}) {
             const extracted = extractUsage(parsed);
             if (extracted) state.usage = mergeUsage(state.usage, extracted);
 
-            const translated = translateResponse(targetFormat, sourceFormat, parsed, state);
+            const translated = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES && parsed.type
+              ? [{ event: parsed.type, data: parsed }]
+              : translateResponse(targetFormat, sourceFormat, parsed, state);
 
             if (translated?._openaiIntermediate) {
               for (const item of translated._openaiIntermediate) {
@@ -482,7 +498,8 @@ export function createSSEStream(options = {}) {
         finalizeStream();
       } catch (error) {
         console.log("Error in flush:", error);
-        finalizeStream();
+        // Preserve failure. Closing here would make a translator error look successful.
+        try { controller.error(error); } catch { /* already closed */ }
       }
     }
   });

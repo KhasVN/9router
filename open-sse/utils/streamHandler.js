@@ -1,6 +1,8 @@
 // Stream handler with disconnect detection - shared for all providers
-import { STREAM_STALL_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { STREAM_STALL_TIMEOUT_MS, SSE_HEARTBEAT_INTERVAL_MS } from "../config/runtimeConfig.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
+
+const heartbeatEncoder = new TextEncoder();
 
 // Get HH:MM:SS timestamp
 function getTimeString() {
@@ -198,7 +200,85 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+// Keep proxy read timers alive without touching the raw-upstream stall watchdog.
+// Heartbeats are SSE comments, so clients ignore them and no model event is fabricated.
+export function createSSEHeartbeatStream(readable, intervalMs = SSE_HEARTBEAT_INTERVAL_MS) {
+  if (!readable || intervalMs <= 0) return readable;
+  const reader = readable.getReader();
+  const heartbeat = heartbeatEncoder.encode(": keepalive\n\n");
+  let pendingRead = null;
+  let closed = false;
+  let released = false;
+  let tail = "\n\n";
+
+  const readNext = () => {
+    pendingRead ??= reader.read();
+    return pendingRead;
+  };
+  const release = () => {
+    if (!released) {
+      released = true;
+      reader.releaseLock();
+    }
+  };
+  const updateTail = (value) => {
+    const suffix = typeof value === "string"
+      ? value.slice(-4)
+      : String.fromCharCode(...value.subarray(Math.max(0, value.length - 4)));
+    tail = (tail + suffix).slice(-4);
+  };
+
+  return new ReadableStream({
+    start(controller) { controller.enqueue(heartbeat); },
+    async pull(controller) {
+      if (closed) return;
+      let timer;
+      try {
+        while (!closed) {
+          const timeout = new Promise(resolve => {
+            timer = setTimeout(() => resolve(null), intervalMs);
+          });
+          const result = await Promise.race([readNext(), timeout]);
+          clearTimeout(timer);
+          timer = null;
+
+          if (!result) {
+            // Never insert a comment inside a partial SSE event. Wait for its
+            // completion instead; framing correctness beats one keepalive.
+            if (!/\r?\n\r?\n$/.test(tail)) continue;
+            if (controller.desiredSize > 0) controller.enqueue(heartbeat);
+            return;
+          }
+
+          pendingRead = null;
+          if (result.done) {
+            closed = true;
+            release();
+            controller.close();
+            return;
+          }
+          updateTail(result.value);
+          controller.enqueue(result.value);
+          return;
+        }
+      } catch (error) {
+        clearTimeout(timer);
+        if (closed) return;
+        closed = true;
+        try { await reader.cancel(error); } catch { /* already closed */ }
+        release();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      if (closed) return;
+      closed = true;
+      try { await reader.cancel(reason); } finally { release(); }
+    },
+  });
+}
+
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, heartbeatIntervalMs = 0) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
@@ -256,9 +336,12 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   const transformedBody = providerResponse.body
     .pipeThrough(upstreamTap)
     .pipeThrough(transformStream);
+  const clientBody = heartbeatIntervalMs > 0
+    ? createSSEHeartbeatStream(transformedBody, heartbeatIntervalMs)
+    : transformedBody;
 
   return createDisconnectAwareStream(
-    { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+    { readable: clientBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
     // Forward a caller-supplied reason (a translator rejection carries the real
     // upstream error) and fall back to the watchdog's own abort message.

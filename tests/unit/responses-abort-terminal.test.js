@@ -131,10 +131,12 @@ describe("stall abort through pipeWithDisconnect", () => {
       new TransformStream(),
       ctrl,
       (message) => { seen = message; return buildStreamErrorBytes(504, message, FORMATS.OPENAI); },
-      50
+      50,
+      10
     );
 
     const text = await readAll(out);
+    expect(text).toContain(": keepalive");
     expect(seen).toBe("stream stall timeout");
     expect(text).toContain('"stream stall timeout"');
     expect(text).toContain("data: [DONE]");

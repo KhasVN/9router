@@ -7,6 +7,7 @@ import { handleChatCore } from "./chatCore.js";
 import { convertResponsesApiFormat } from "../translator/formats/responsesApi.js";
 import { createResponsesApiTransformStream } from "../transformer/responsesTransformer.js";
 import { convertResponsesStreamToJson } from "../transformer/streamToJsonConverter.js";
+import { createErrorResult } from "../utils/error.js";
 import { SSE_HEADERS_CORS } from "../utils/sseConstants.js";
 
 /**
@@ -57,6 +58,12 @@ export async function handleResponsesCore({ body, modelInfo, credentials, log, o
   if (!clientRequestedStreaming && contentType.includes("text/event-stream")) {
     try {
       const jsonResponse = await convertResponsesStreamToJson(response.body);
+      if (jsonResponse.status !== "completed" && jsonResponse.status !== "done" && jsonResponse.status !== "incomplete") {
+        return createErrorResult(
+          502,
+          jsonResponse.error?.message || `Upstream Responses stream ended with status ${jsonResponse.status}`
+        );
+      }
 
       return {
         success: true,
