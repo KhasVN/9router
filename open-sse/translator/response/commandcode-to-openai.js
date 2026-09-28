@@ -132,7 +132,7 @@ export function commandCodeToOpenAIResponse(chunk, state) {
     }
     case "tool-call": {
       // Final consolidated tool call — only emit if we never saw tool-input-* deltas.
-      const id = event.toolCallId;
+      const id = event.toolCallId || fallbackToolCallId(state.toolIndex);
       if (state.toolIndexById.has(id)) break;
       const idx = state.toolIndex++;
       state.toolIndexById.set(id, idx);
@@ -169,6 +169,9 @@ export function commandCodeToOpenAIResponse(chunk, state) {
         throw new Error(`[CommandCode error: ${errStr}]`);
       }
       const finishReason = state.finishReason || mapFinishReason(event.finishReason || "stop");
+      if (state.chunkIndex === 0 && !state.openText && state.openTools.size === 0) {
+        throw new Error(`[CommandCode error: upstream returned empty generation with finishReason ${finishReason}]`);
+      }
       const finalChunk = makeChunk(state, {}, finishReason);
       const totalUsage = event.totalUsage || state.usage;
       const usage = toOpenAIUsage(totalUsage, "commandcode");

@@ -248,9 +248,12 @@ export function openaiToClaudeResponse(chunk, state) {
 
     // Use tracked usage (will be estimated in stream.js if not valid)
     const finalUsage = state.usage || { input_tokens: 0, output_tokens: 0 };
+    const effectiveStopReason = choice.finish_reason === "tool_calls" && (!state.toolCalls || state.toolCalls.size === 0)
+      ? convertFinishReason("stop")
+      : convertFinishReason(choice.finish_reason);
     results.push({
       type: "message_delta",
-      delta: { stop_reason: convertFinishReason(choice.finish_reason) },
+      delta: { stop_reason: effectiveStopReason },
       usage: finalUsage
     });
     results.push({ type: "message_stop" });

@@ -45,7 +45,7 @@ export class CommandCodeExecutor extends BaseExecutor {
       const result = await super.execute(opts);
       if (!result?.response?.ok || !result.response.body) return result;
 
-      const wrappedResponse = await inspectAndWrapCommandCodeResponse(result.response, opts.model);
+      const wrappedResponse = await inspectAndWrapCommandCodeResponse(result.response, opts.model, attempt);
       if (!wrappedResponse.ok && attempt < maxRetries) {
         const isRetryableStatus = wrappedResponse.status === 502 || wrappedResponse.status === 503 || wrappedResponse.status === 504;
         if (isRetryableStatus) {
@@ -137,30 +137,54 @@ export function parseCommandCodeError(event) {
   return { statusCode, message, type };
 }
 
-export async function inspectAndWrapCommandCodeResponse(originalResponse, model) {
+const COMMANDCODE_PEEK_TIMEOUT_MS = 10000;
+
+export async function inspectAndWrapCommandCodeResponse(originalResponse, model, attempt = "-") {
   const reader = originalResponse.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  // Replay raw bytes, including events after the peek and any split UTF-8 character.
-  const bufferedChunks = [];
+  const rawChunks = [];
   let detectedError = null;
+  let hasContent = false;
+  let pendingRead = null;
+  let timer = null;
+
+  const deadline = new Promise(resolve => {
+    timer = setTimeout(() => resolve({ timeout: true }), COMMANDCODE_PEEK_TIMEOUT_MS);
+  });
 
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      pendingRead = reader.read();
+      const next = await Promise.race([pendingRead, deadline]);
+      if (next?.timeout) {
+        break;
+      }
+      pendingRead = null;
+      const { value, done } = next;
       if (done) {
-        const trimmed = (buffer + decoder.decode()).trim();
+        const trimmed = buffer.trim();
         if (trimmed) {
           try {
             const jsonStr = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
             const parsed = JSON.parse(jsonStr);
-            if (parsed?.type === "error") detectedError = parsed;
-          } catch { /* replay unparsed bytes below */ }
+            if (parsed?.type === "error") {
+              detectedError = parsed;
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        if (!hasContent && !detectedError) {
+          detectedError = {
+            type: "error",
+            error: { message: "upstream generation completed empty", statusCode: 503 }
+          };
         }
         break;
       }
 
-      bufferedChunks.push(value);
+      rawChunks.push(value);
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
@@ -188,29 +212,29 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
           break;
         }
 
-        // AI SDK v5 also reports failure via finishReason "error" on the terminal
-        // parts. Treat it as an upstream error so the caller gets a non-2xx and can
-        // fall back to the next account/combo entry instead of streaming a 200.
-        if (
-          (event?.type === "finish-step" || event?.type === "finish") &&
-          event?.finishReason === "error"
-        ) {
-          detectedError = {
-            type: "error",
-            error: event.error ?? { message: "upstream generation error", statusCode: 503 },
-          };
-          stopLoop = true;
-          break;
-        }
-
         if (
           event?.type === "text-delta" ||
           event?.type === "reasoning-delta" ||
           event?.type === "tool-input-start" ||
-          event?.type === "tool-call" ||
-          event?.type === "finish" ||
-          event?.type === "finish-step"
+          event?.type === "tool-call"
         ) {
+          hasContent = true;
+          stopLoop = true;
+          break;
+        }
+
+        if (event?.type === "finish-step" || event?.type === "finish") {
+          if (event?.finishReason === "error") {
+            detectedError = {
+              type: "error",
+              error: event.error ?? { message: "upstream generation error", statusCode: 503 },
+            };
+          } else if (!hasContent) {
+            detectedError = {
+              type: "error",
+              error: event.error ?? { message: `upstream returned empty generation (${event.finishReason || "no-content"})`, statusCode: 503 },
+            };
+          }
           stopLoop = true;
           break;
         }
@@ -218,9 +242,11 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
 
       if (stopLoop) break;
     }
-  } catch (err) {
-    try { await reader.cancel(err); } catch { /* ignore */ }
-    throw err;
+  } catch {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+    return originalResponse;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 
   if (detectedError) {
@@ -245,22 +271,28 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model)
     );
   }
 
-  const combinedStream = createReplayedStream(bufferedChunks, reader);
+  const combinedStream = createRawReplayedStream(rawChunks, reader, pendingRead);
   return wrapNdjsonAsOpenAISse(combinedStream, model, originalResponse);
 }
 
-function createReplayedStream(bufferedChunks, reader) {
+function createRawReplayedStream(rawChunks, reader, pendingRead = null) {
+  let chunkIndex = 0;
+  let pending = pendingRead;
+
   return new ReadableStream({
-    start(controller) {
-      for (const chunk of bufferedChunks) controller.enqueue(chunk);
-    },
     async pull(controller) {
+      if (chunkIndex < rawChunks.length) {
+        controller.enqueue(rawChunks[chunkIndex++]);
+        return;
+      }
+
       try {
-        const { value, done } = await reader.read();
-        if (done) {
+        const next = await (pending || reader.read());
+        pending = null;
+        if (next.done) {
           controller.close();
         } else {
-          controller.enqueue(value);
+          controller.enqueue(next.value);
         }
       } catch (err) {
         controller.error(err);
