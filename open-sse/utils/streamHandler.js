@@ -348,4 +348,3 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     onAbortTerminal ? (message = null) => onAbortTerminal(message ?? abortMessage) : null
   );
 }
-
