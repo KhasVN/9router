@@ -105,10 +105,15 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
   if (targetFormat === FORMATS.CLAUDE && sourceFormat === FORMATS.OPENAI) {
     return openAICompletionToClaudeMessage(responseBody);
   }
-  if (targetFormat === FORMATS.OPENAI) return responseBody;
 
-  // Gemini / Antigravity
-  if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.ANTIGRAVITY || targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.VERTEX) {
+  // Pivot Gemini source through OpenAI when targeting Claude
+  if (targetFormat === FORMATS.CLAUDE && (sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI_CLI || sourceFormat === FORMATS.VERTEX)) {
+    const openaiBody = translateNonStreamingResponse(responseBody, FORMATS.OPENAI, sourceFormat, customToolNames);
+    return translateNonStreamingResponse(openaiBody, FORMATS.CLAUDE, FORMATS.OPENAI, customToolNames);
+  }
+
+  // Gemini / Antigravity source → convert to OpenAI
+  if (targetFormat === FORMATS.OPENAI && (sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI_CLI || sourceFormat === FORMATS.VERTEX)) {
     const response = responseBody.response || responseBody;
     if (!response?.candidates?.[0]) return responseBody;
 
