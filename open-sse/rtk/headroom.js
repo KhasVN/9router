@@ -322,17 +322,24 @@ export async function compressWithHeadroom(body, { enabled, url, model, format, 
       return data;
     }
 
-    // OpenAI shape: messages/input go straight to the proxy.
-    const key = Array.isArray(body.messages) ? "messages"
+    // OpenAI shape: messages/input go straight to the proxy. CommandCode nested params.messages extracted.
+    let key = Array.isArray(body.messages) ? "messages"
       : Array.isArray(body.input) ? "input"
       : null;
+    let nested = false;
+    if (!key && Array.isArray(body.params?.messages)) {
+      key = "messages";
+      nested = true;
+    }
     if (!key) {
       setDiagnostic(diagnostics, `unsupported ${format || "unknown"} request shape`);
       return null;
     }
-    const data = await callCompress(url, body[key], model, timeoutMs, compressUserMessages, diagnostics || {});
+    const messages = nested ? body.params.messages : body[key];
+    const data = await callCompress(url, messages, model, timeoutMs, compressUserMessages, diagnostics || {});
     if (!data) return null;
-    body[key] = data.messages;
+    if (nested) body.params.messages = data.messages;
+    else body[key] = data.messages;
     if (diagnostics) diagnostics.after = captureSizeSnapshot(body);
     return data;
   } catch (error) {

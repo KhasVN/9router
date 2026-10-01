@@ -585,20 +585,6 @@ function handleResponsesTerminal(state, eventType, data) {
 export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (!chunk) {
     if (state.finishReasonSent) return null;
-
-    // Graceful completion: Codex closed cleanly after delivering content without terminal event.
-    // Safe when: content delivered, no partial tool calls, clean EOF.
-    const hasContent = (state.completedOutputItems?.size > 0) ||
-      Object.keys(state.msgTextBuf || {}).some(k => state.msgTextBuf[k]);
-    const hasPartialTools = Object.keys(state.funcCallIds || {}).some(k => !state.funcItemDone?.[k]);
-
-    if (hasContent && !hasPartialTools) {
-      state.responsesTerminalSeen = true;
-      return handleResponsesTerminal(state, "response.completed", {
-        response: { status: "completed" }
-      });
-    }
-
     throwResponsesFailure(state, "error", { message: "stream closed before response.completed" });
   }
 

@@ -97,15 +97,19 @@ function toContentBlocks(content) {
   return [{ type: OPENAI_BLOCK.TEXT, text: String(content) }];
 }
 
-function safeParseJson(s) {
-  if (s == null) return {};
-  if (typeof s !== "string") return s;
-  try { return JSON.parse(s); } catch { return {}; }
-}
-
 function convertMessages(messages = []) {
   const out = [];
   const systemTexts = [];
+  const toolNameMap = new Map();
+
+  // Build toolCallId -> toolName map from assistant tool_calls
+  for (const m of messages) {
+    if (Array.isArray(m?.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (tc.id && tc.function?.name) toolNameMap.set(tc.id, tc.function.name);
+      }
+    }
+  }
 
   for (const m of messages) {
     if (!m) continue;
@@ -119,12 +123,14 @@ function convertMessages(messages = []) {
 
     if (role === ROLE.TOOL) {
       const value = typeof m.content === "string" ? m.content : flattenText(m.content);
+      const toolCallId = m.tool_call_id || "";
+      const toolName = m.name || toolNameMap.get(toolCallId) || "tool";
       out.push({
         role: ROLE.TOOL,
         content: [{
           type: "tool-result",
-          toolCallId: m.tool_call_id || "",
-          toolName: m.name || "",
+          toolCallId,
+          toolName,
           output: { type: "text", value },
         }],
       });
@@ -134,19 +140,25 @@ function convertMessages(messages = []) {
     if (role === ROLE.ASSISTANT) {
       const blocks = [];
       const rc = m.reasoning_content || m.thought || m.reasoning;
-      if (rc || (Array.isArray(m.tool_calls) && m.tool_calls.length > 0)) {
-        blocks.push({ type: "reasoning", text: rc || " " });
+      if (rc && String(rc).trim()) {
+        blocks.push({ type: "reasoning", text: String(rc).trim() });
       }
       const text = flattenText(m.content);
       if (text) blocks.push({ type: OPENAI_BLOCK.TEXT, text });
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
           const fn = tc.function || {};
+          let input;
+          try {
+            input = typeof fn.arguments === "string" ? JSON.parse(fn.arguments) : fn.arguments;
+          } catch {
+            input = fn.arguments;
+          }
           blocks.push({
             type: "tool-call",
             toolCallId: tc.id || "",
             toolName: fn.name || "",
-            input: safeParseJson(fn.arguments),
+            input: input || {},
           });
         }
       }

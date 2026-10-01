@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
+import { FORMATS } from "../translator/formats.js";
 import { commandCodeToOpenAIResponse } from "../translator/response/commandcode-to-openai.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
 
@@ -18,11 +19,6 @@ import { SSE_DONE } from "../utils/sseConstants.js";
 export class CommandCodeExecutor extends BaseExecutor {
   constructor() {
     super("commandcode", PROVIDERS.commandcode);
-  }
-
-  transformRequest(model, body, stream, credentials) {
-    body.stream = true;
-    return body;
   }
 
   buildHeaders(credentials, stream = true) {
@@ -56,6 +52,7 @@ export class CommandCodeExecutor extends BaseExecutor {
       }
 
       result.response = wrappedResponse;
+      result.responseFormat = FORMATS.OPENAI;
       return result;
     }
   }
@@ -242,9 +239,9 @@ export async function inspectAndWrapCommandCodeResponse(originalResponse, model,
 
       if (stopLoop) break;
     }
-  } catch {
+  } catch (error) {
     try { reader.releaseLock(); } catch { /* ignore */ }
-    return originalResponse;
+    throw error;
   } finally {
     if (timer) clearTimeout(timer);
   }

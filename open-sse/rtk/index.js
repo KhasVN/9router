@@ -14,9 +14,10 @@ export function compressMessages(body, enabled) {
     return compressKiroFormat(body, enabled);
   }
 
-  // Support both OpenAI/Claude "messages" and OpenAI Responses "input"
+  // Support OpenAI/Claude "messages", OpenAI Responses "input", CommandCode nested "params.messages"
   const items = Array.isArray(body.messages) ? body.messages
     : Array.isArray(body.input) ? body.input
+    : Array.isArray(body.params?.messages) ? body.params.messages
     : null;
   if (!items) return null;
 

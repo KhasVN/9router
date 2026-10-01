@@ -134,14 +134,8 @@ export async function convertResponsesStreamToJson(stream) {
   }
 
   if (!state.terminalSeen && state.status === "in_progress") {
-    // Graceful completion: items delivered via output_item.done events.
-    // Codex may close connection after delivering content without terminal event.
-    if (state.items.size > 0) {
-      state.status = "completed";
-    } else {
-      state.status = "failed";
-      state.error = { message: "stream closed before response.completed" };
-    }
+    state.status = "failed";
+    state.error = { message: "stream closed before response.completed" };
   }
 
   const result = {

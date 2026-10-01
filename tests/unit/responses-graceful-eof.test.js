@@ -5,7 +5,7 @@ import { Readable } from "stream";
 
 describe("Responses graceful EOF handling", () => {
   describe("Translator: openaiResponsesToOpenAIResponse", () => {
-    it("completes when content delivered and no partial tools", () => {
+    it("fails on EOF even with content delivered (strict terminal check)", () => {
       const state = {
         chatId: "chatcmpl-test",
         created: 1700000000,
@@ -20,12 +20,8 @@ describe("Responses graceful EOF handling", () => {
         responsesTerminalSeen: false
       };
 
-      const result = openaiResponsesToOpenAIResponse(null, state);
-
-      expect(state.finishReasonSent).toBe(true);
-      expect(state.responsesTerminalSeen).toBe(true);
-      expect(result).toBeDefined();
-      expect(result.choices[0].finish_reason).toBe("stop");
+      expect(() => openaiResponsesToOpenAIResponse(null, state))
+        .toThrow(/stream closed before response.completed/);
     });
 
     it("fails on empty generation EOF", () => {
@@ -62,7 +58,7 @@ describe("Responses graceful EOF handling", () => {
         .toThrow(/stream closed before response.completed/);
     });
 
-    it("completes when text buffered but not yet closed", () => {
+    it("fails on EOF with buffered text (strict terminal check)", () => {
       const state = {
         chatId: "chatcmpl-test",
         created: 1700000000,
@@ -77,10 +73,8 @@ describe("Responses graceful EOF handling", () => {
         responsesTerminalSeen: false
       };
 
-      const result = openaiResponsesToOpenAIResponse(null, state);
-
-      expect(state.finishReasonSent).toBe(true);
-      expect(result.choices[0].finish_reason).toBe("stop");
+      expect(() => openaiResponsesToOpenAIResponse(null, state))
+        .toThrow(/stream closed before response.completed/);
     });
 
     it("returns null when finishReasonSent already true", () => {
@@ -109,15 +103,14 @@ describe("Responses graceful EOF handling", () => {
       .map(({ event, data }) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
       .join("");
 
-    it("completes when output_item.done delivered but no terminal event", async () => {
+    it("fails on EOF even after output_item.done (strict terminal check)", async () => {
       const result = await convertResponsesStreamToJson(streamOf(wire([
         { event: "response.created", data: { type: "response.created", response: { id: "resp_1", created_at: 1700000000, status: "in_progress" } } },
         { event: "response.output_item.done", data: { type: "response.output_item.done", output_index: 0, item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] } } }
       ])));
 
-      expect(result.status).toBe("completed");
-      expect(result.output[0].content[0].text).toBe("done");
-      expect(result.error).toBeNull();
+      expect(result.status).toBe("failed");
+      expect(result.error.message).toContain("before response.completed");
     });
 
     it("fails on EOF without items or terminal event", async () => {
@@ -140,17 +133,15 @@ describe("Responses graceful EOF handling", () => {
       expect(result.error.message).toBe("explicit error");
     });
 
-    it("completes with multiple items delivered", async () => {
+    it("fails on EOF even with multiple items delivered (strict terminal check)", async () => {
       const result = await convertResponsesStreamToJson(streamOf(wire([
         { event: "response.created", data: { type: "response.created", response: { id: "resp_1", status: "in_progress" } } },
         { event: "response.output_item.done", data: { type: "response.output_item.done", output_index: 0, item: { type: "message", content: [{ type: "output_text", text: "first" }] } } },
         { event: "response.output_item.done", data: { type: "response.output_item.done", output_index: 1, item: { type: "function_call", call_id: "call_123", name: "get_weather", arguments: "{}" } } }
       ])));
 
-      expect(result.status).toBe("completed");
-      expect(result.output).toHaveLength(2);
-      expect(result.output[0].content[0].text).toBe("first");
-      expect(result.output[1].type).toBe("function_call");
+      expect(result.status).toBe("failed");
+      expect(result.error.message).toContain("before response.completed");
     });
   });
 });
