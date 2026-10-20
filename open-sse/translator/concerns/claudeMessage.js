@@ -1,6 +1,6 @@
-import { FORMATS } from "../../translator/formats.js";
-import { ROLE, CLAUDE_BLOCK } from "../../translator/schema/index.js";
-import { fromOpenAIFinish } from "../../translator/concerns/finishReason.js";
+import { FORMATS } from "../formats.js";
+import { fromOpenAIFinish } from "./finishReason.js";
+import { CLAUDE_BLOCK, MODEL_FALLBACK, RESPONSES_ITEM, ROLE } from "../schema/index.js";
 
 function parseToolArguments(value) {
   if (!value) return {};
@@ -12,7 +12,6 @@ function parseToolArguments(value) {
   }
 }
 
-// Shared by ordinary JSON and forced-stream JSON responses; no handler imports.
 export function openAICompletionToClaudeMessage(responseBody) {
   if (!responseBody?.choices?.[0]) return responseBody;
   const choice = responseBody.choices[0];
@@ -40,9 +39,9 @@ export function openAICompletionToClaudeMessage(responseBody) {
   const usage = responseBody.usage || {};
   return {
     id: String(responseBody.id || `msg_${Date.now()}`).replace(/^chatcmpl-/, ""),
-    type: "message",
+    type: RESPONSES_ITEM.MESSAGE,
     role: ROLE.ASSISTANT,
-    model: responseBody.model || "unknown",
+    model: responseBody.model || MODEL_FALLBACK,
     content,
     stop_reason: fromOpenAIFinish(choice.finish_reason, FORMATS.CLAUDE),
     stop_sequence: null,
