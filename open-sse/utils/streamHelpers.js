@@ -45,6 +45,7 @@ export function hasValuableContent(chunk, format) {
     const delta = chunk.choices[0].delta;
     return delta.content && delta.content !== "" ||
            delta.reasoning_content && delta.reasoning_content !== "" ||
+           (typeof delta.encrypted_content === "string" && delta.encrypted_content !== "") ||
            delta.tool_calls && delta.tool_calls.length > 0 ||
            chunk.choices[0].finish_reason ||
            delta.role;
@@ -56,8 +57,9 @@ export function hasValuableContent(chunk, format) {
     const hasText = chunk.delta?.text && chunk.delta.text !== "";
     const hasThinking = chunk.delta?.thinking && chunk.delta.thinking !== "";
     const hasInputJson = chunk.delta?.partial_json && chunk.delta.partial_json !== "";
-    
-    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson) {
+    const hasSignature = chunk.delta?.signature && chunk.delta.signature !== "";
+
+    if (isContentBlockDelta && !hasText && !hasThinking && !hasInputJson && !hasSignature) {
       return false;
     }
     return true;

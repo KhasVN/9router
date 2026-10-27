@@ -341,16 +341,14 @@ function wrapNdjsonAsOpenAISse(streamBody, model, originalResponse = null) {
   });
 
   const newBody = streamBody.pipeThrough(transform);
+  const responseHeaders = new Headers(originalResponse?.headers || {});
+  responseHeaders.set("content-type", "text/event-stream");
+  responseHeaders.set("cache-control", "no-cache");
+  responseHeaders.set("connection", "keep-alive");
   return new Response(newBody, {
     status: originalResponse?.status || 200,
     statusText: originalResponse?.statusText || "OK",
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      ...(originalResponse?.headers ? Object.fromEntries(originalResponse.headers.entries()) : {}),
-      "content-type": "text/event-stream",
-    },
+    headers: responseHeaders,
   });
 }
 

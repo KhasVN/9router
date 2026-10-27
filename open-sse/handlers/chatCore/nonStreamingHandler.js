@@ -93,27 +93,27 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
 }
 
 /**
- * Translate non-streaming response body from provider format → OpenAI format.
+ * Translate provider response (targetFormat) back to client format (sourceFormat).
  */
 export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null) {
   if (targetFormat === sourceFormat) return responseBody;
+  // Normalize provider JSON once, then reuse the client-format converter.
+  if (targetFormat !== FORMATS.OPENAI && (sourceFormat === FORMATS.CLAUDE || sourceFormat === FORMATS.OPENAI_RESPONSES)) {
+    responseBody = translateNonStreamingResponse(responseBody, targetFormat, FORMATS.OPENAI, customToolNames);
+    targetFormat = FORMATS.OPENAI;
+  }
   // Provider responded in OpenAI Chat Completions shape but the client speaks
   // Responses API — convert so tool_calls/text surface as Responses `output`.
   if (targetFormat === FORMATS.OPENAI && sourceFormat === FORMATS.OPENAI_RESPONSES) {
     return openAICompletionToResponses(responseBody, customToolNames);
   }
-  if (targetFormat === FORMATS.CLAUDE && sourceFormat === FORMATS.OPENAI) {
+  if (targetFormat === FORMATS.OPENAI && sourceFormat === FORMATS.CLAUDE) {
     return openAICompletionToClaudeMessage(responseBody);
   }
+  if (targetFormat === FORMATS.OPENAI) return responseBody;
 
-  // Pivot Gemini source through OpenAI when targeting Claude
-  if (targetFormat === FORMATS.CLAUDE && (sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI_CLI || sourceFormat === FORMATS.VERTEX)) {
-    const openaiBody = translateNonStreamingResponse(responseBody, FORMATS.OPENAI, sourceFormat, customToolNames);
-    return translateNonStreamingResponse(openaiBody, FORMATS.CLAUDE, FORMATS.OPENAI, customToolNames);
-  }
-
-  // Gemini / Antigravity source → convert to OpenAI
-  if (targetFormat === FORMATS.OPENAI && (sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI_CLI || sourceFormat === FORMATS.VERTEX)) {
+  // Gemini / Antigravity
+  if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.ANTIGRAVITY || targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.VERTEX) {
     const response = responseBody.response || responseBody;
     if (!response?.candidates?.[0]) return responseBody;
 

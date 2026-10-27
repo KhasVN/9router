@@ -128,17 +128,11 @@ export class BaseExecutor {
       const url = this.buildUrl(model, stream, urlIndex, credentials);
       const transformedBody = this.transformRequest(model, body, stream, credentials);
       const headers = this.buildHeaders(credentials, stream, url, model, transformedBody);
-      // User per-provider override wins over registry headers (blocked names filtered at the API)
-      if (providerOverrides?.headers) Object.assign(headers, providerOverrides.headers);
-  // Fork security fix: defense-in-depth check on header overrides
-  if (providerOverrides?.headers) {
-    const blocked = Object.keys(providerOverrides.headers).filter(k =>
-      ["host","content-length","content-type","connection","transfer-encoding","authorization","cookie","x-api-key","proxy-authorization"].includes(k.toLowerCase()));
-    if (blocked.length) {
-      console.warn(`[Executor] Blocked header overrides: ${blocked.join(", ")}`);
-      for (const k of blocked) delete providerOverrides.headers[k];
-    }
-  }
+      // Filter before merging; never mutate saved overrides or replace credentials.
+      for (const [name, value] of Object.entries(providerOverrides?.headers || {})) {
+        if (["host", "content-length", "content-type", "connection", "transfer-encoding", "authorization", "cookie", "x-api-key", "proxy-authorization"].includes(name.toLowerCase())) continue;
+        headers[name] = value;
+      }
 
       if (!retryAttemptsByUrl[urlIndex]) retryAttemptsByUrl[urlIndex] = 0;
 

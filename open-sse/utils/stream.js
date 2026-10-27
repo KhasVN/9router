@@ -4,12 +4,13 @@ import { PROVIDERS } from "../config/providers.js";
 import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds } from "./streamHelpers.js";
+import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes, ensureStreamToolCallIds } from "./streamHelpers.js";
 import { restoreToolNames } from "./opencodeFingerprint.js";
-import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure, buildAbortedResponsesTerminalBytes } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
 import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
+import { HTTP_STATUS } from "../config/runtimeConfig.js";
 
 export { COLORS, formatSSE };
 export { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER };
@@ -97,6 +98,7 @@ export function createSSEStream(options = {}) {
   let openAIResponsesDoneSent = false;
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
+  let streamFailed = false;
   let completionFlushTimer = null;
 
   // Lane quirk: upstream streams thinking under the OpenRouter aliases
@@ -104,6 +106,16 @@ export function createSSEStream(options = {}) {
   // Free's MiMo route does. Lift it on every passthrough delta so OpenAI-shaped
   // clients, the thinking accumulation below and usage accounting see the text.
   const liftAliases = mode === STREAM_MODE.PASSTHROUGH && !!PROVIDERS[provider]?.quirks?.reasoningAliasFields;
+  const emitEmptyStreamError = (controller) => {
+    const message = "Upstream stream ended without response events";
+    const bytes = sourceFormat === FORMATS.OPENAI_RESPONSES
+      ? buildAbortedResponsesTerminalBytes(message)
+      : buildStreamErrorBytes(HTTP_STATUS.BAD_GATEWAY, message, sourceFormat);
+    reqLogger?.appendConvertedChunk?.(new TextDecoder().decode(bytes));
+    controller.enqueue(bytes);
+    streamFailed = true;
+    streamDoneSent = true;
+  };
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
   // closes right after the terminal event cancels the reader, and flush() never runs.
@@ -111,6 +123,10 @@ export function createSSEStream(options = {}) {
     if (completionFlushTimer) { clearTimeout(completionFlushTimer); completionFlushTimer = null; }
     if (finalized) return;
     finalized = true;
+    if (streamFailed) {
+      appendRequestLog({ model, provider, connectionId, tokens: null, status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` }).catch(() => {});
+      return;
+    }
 
     const isPassthrough = mode === STREAM_MODE.PASSTHROUGH;
     let finalUsage = isPassthrough ? usage : state?.usage;
@@ -148,7 +164,7 @@ export function createSSEStream(options = {}) {
     finalizeStream();
   };
 
-  return new TransformStream({
+  const transformer = {
     transform(chunk, controller) {
       if (!ttftAt) ttftAt = Date.now();
       const text = decoder.decode(chunk, { stream: true });
@@ -575,6 +591,8 @@ export function createSSEStream(options = {}) {
           openAIResponsesTerminalSeen = true;
         }
 
+        if (sseEmittedCount === 0) emitEmptyStreamError(controller);
+
         if (keepsOpenAIResponsesFormat && !openAIResponsesDoneSent && !streamDoneSent) {
           const doneOutput = "data: [DONE]\n\n";
           reqLogger?.appendConvertedChunk?.(doneOutput);
@@ -590,7 +608,8 @@ export function createSSEStream(options = {}) {
         try { controller.error(error); } catch { /* already closed */ }
       }
     }
-  });
+  }
+  return new TransformStream(transformer);
 }
 
 export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider = null, reqLogger = null, toolNameMap = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, customToolNames = null, credentials = null) {
@@ -611,9 +630,8 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null, sourceFormat = null) {
   return createSSEStream({
-    mode: STREAM_MODE.PASSTHROUGH,
     provider,
     reqLogger,
     toolNameMap,
@@ -621,6 +639,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
     connectionId,
     body,
     onStreamComplete,
-    apiKey
+    apiKey,
+    sourceFormat
   });
 }

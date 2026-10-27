@@ -167,9 +167,24 @@ function convertClaudeMessage(msg) {
     const parts = [];
     const toolCalls = [];
     const toolResults = [];
+    // Thinking blocks are the only multi-turn reasoning carry Claude clients
+    // resend. Keep text as reasoning_content and the opaque signature as
+    // encrypted_content so Responses targets can replay it (Meta encrypted
+    // reasoning continuity); other targets ignore both fields.
+    let thinkingText = "";
+    let thinkingSig = "";
 
     for (const block of msg.content) {
       switch (block.type) {
+        case CLAUDE_BLOCK.THINKING:
+          thinkingText += block.thinking || "";
+          if (block.signature) thinkingSig = block.signature;
+          break;
+
+        case CLAUDE_BLOCK.REDACTED_THINKING:
+          if (block.data) thinkingSig = block.data;
+          break;
+
         case CLAUDE_BLOCK.TEXT:
           parts.push({ type: OPENAI_BLOCK.TEXT, text: block.text });
           break;
@@ -248,16 +263,23 @@ function convertClaudeMessage(msg) {
       if (parts.length > 0) {
         result.content = collapseTextParts(parts);
       }
+      if (thinkingSig) result.encrypted_content = thinkingSig;
+      if (thinkingText.trim()) result.reasoning_content = thinkingText;
       result.tool_calls = toolCalls;
       return result;
     }
 
     // Return content
     if (parts.length > 0) {
-      return {
+      const result = {
         role,
         content: collapseTextParts(parts)
       };
+      if (role === ROLE.ASSISTANT) {
+        if (thinkingSig) result.encrypted_content = thinkingSig;
+        if (thinkingText.trim()) result.reasoning_content = thinkingText;
+      }
+      return result;
     }
     
     // Empty content array

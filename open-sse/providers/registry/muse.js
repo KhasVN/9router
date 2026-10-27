@@ -1,7 +1,8 @@
 // Muse (Meta Model API) — dual auth (same pattern as kimi):
 //   oauth  = Muse Code subscription (Meta account device code, mints an LLM|… key)
 //   apikey = pay-as-you-go Model API key from dev.meta.ai
-// Transport is shared; oauth accounts get x-api-version via the museHeaders hook.
+// Transport is shared. Native Muse client sends no x-api-version on the
+// data plane (only on auth endpoints), so none is added here.
 // Meta issues no refresh token for the subscription flow → re-login on 401.
 export default {
   id: "muse",
@@ -33,7 +34,7 @@ export default {
     baseUrl: "https://api.meta.ai/v1/chat/completions",
     validateUrl: "https://api.meta.ai/v1/models",
     modelsUrl: "https://api.meta.ai/v1/models",
-    auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
+    auth: { combined: true, header: "Authorization", scheme: "bearer" },
   },
   // Multi-endpoint: Meta accepts Chat Completions and Responses wire formats on
   // the same key (https://dev.meta.ai/docs/protocols). Muse Spark reasoning
@@ -43,14 +44,12 @@ export default {
     {
       format: "openai",
       baseUrl: "https://api.meta.ai/v1/chat/completions",
-      auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
+      auth: { combined: true, header: "Authorization", scheme: "bearer" },
     },
     {
       format: "openai-responses",
       baseUrl: "https://api.meta.ai/v1/responses",
-      auth: { combined: true, header: "Authorization", scheme: "bearer", hooks: ["museHeaders"] },
-      // Strict Responses API: rejects top-level reasoning_effort, needs reasoning:{effort,summary}.
-      thinkingFormat: "openai-responses",
+      auth: { combined: true, header: "Authorization", scheme: "bearer" },
     },
   ],
   models: [

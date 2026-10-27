@@ -7,6 +7,7 @@ import { FORMATS } from "../formats.js";
 import { buildChunk } from "../concerns/chunk.js";
 import { buildUsage } from "../concerns/usage.js";
 import { fallbackToolCallId } from "../concerns/toolCall.js";
+import { toResponsesFinish } from "../concerns/finishReason.js";
 import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
 import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
 
@@ -452,14 +453,15 @@ function collectCompletedOutputItems(state) {
 
 function sendCompleted(state, emit) {
   if (!state.completedSent) {
+    const terminal = toResponsesFinish(state.responsesFinishReason);
     state.completedSent = true;
-    emit("response.completed", {
-      type: "response.completed",
+    emit(`response.${terminal.status}`, {
+      type: `response.${terminal.status}`,
       response: {
         id: state.responseId,
         object: "response",
         created_at: state.created,
-        status: "completed",
+        ...terminal,
         background: false,
         error: null,
         output: collectCompletedOutputItems(state),
@@ -471,12 +473,14 @@ function sendCompleted(state, emit) {
 function flushEvents(state) {
   if (state.completedSent) return [];
 
-  // EOF is not a finish_reason. On pivot routes (flush never reaches us via the
-  // terminal null chunk) complete only after authoritative upstream finish_reason
-  // was seen; otherwise preserve truncated-stream failure. The direct
-  // openai:openai-responses route null-flushes normally, so it completes here.
-  const flushReachesUs = state.targetFormat === FORMATS.OPENAI;
-  if (!state.responsesFinishReason && !flushReachesUs) {
+  // EOF without finish_reason is truncated on pivot routes (a real upstream
+  // chunk stream) — preserve failure there. On the direct Chat→Responses
+  // route (targetFormat OPENAI marks it: finish handling above defers
+  // completion to this flush), complete from recorded items instead.
+  if (state.targetFormat === FORMATS.OPENAI && !state.responsesFinishReason) {
+    state.responsesFinishReason = OPENAI_FINISH.STOP;
+  }
+  if (!state.responsesFinishReason && state.targetFormat !== FORMATS.OPENAI) {
     throw new Error("stream closed before upstream finish_reason");
   }
 
@@ -514,9 +518,11 @@ function getResponsesIncompleteReason(data) {
 
 function getResponsesIncompleteFinishReason(data) {
   const reason = getResponsesIncompleteReason(data);
-  if (["max_tokens", "max_output_tokens"].includes(reason)) return OPENAI_FINISH.LENGTH;
   if (reason === "content_filter") return OPENAI_FINISH.CONTENT_FILTER;
-  return null;
+  // Any other incomplete (incl. missing/unknown reason) still means truncated
+  // output. Mapping to length keeps the turn honest (Claude: max_tokens)
+  // instead of throwing mid-stream after partial output was already sent.
+  return OPENAI_FINISH.LENGTH;
 }
 
 function getResponsesFailureDetail(eventType, data, status) {
@@ -607,6 +613,8 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     state.respToolChatIndex ??= new Map();
     // Indices that already received argument deltas (guards done-with-args).
     state.respToolArgsEmitted ??= new Set();
+    // Argument fragments seen before their output_item.added (item_id → text).
+    state.respPendingArgs ??= new Map();
   }
 
   // Text content delta
@@ -643,6 +651,15 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       if (key) state.respToolChatIndex.set(key, idx);
     }
 
+    // Flush any argument fragments that arrived before this added event.
+    let initialArgs = "";
+    if (key && state.respPendingArgs?.has(key)) {
+      initialArgs = state.respPendingArgs.get(key);
+      state.respPendingArgs.delete(key);
+      state.respToolArgsEmitted ??= new Set();
+      state.respToolArgsEmitted.add(idx);
+    }
+
     return buildChunk(
       { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
       {
@@ -650,7 +667,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
           index: idx,
           id: state.currentToolCallId,
           type: OPENAI_BLOCK.FUNCTION,
-          function: { name: item.name || "", arguments: "" }
+          function: { name: item.name || "", arguments: initialArgs }
         }]
       }
     );
@@ -662,6 +679,14 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     const argsDelta = data.delta || "";
     if (!argsDelta) return null;
 
+    // Fragment for a call whose output_item.added has not arrived yet: buffer
+    // it instead of mis-attributing it to the most recent call (corrupts JSON).
+    if (data.item_id && !state.respToolChatIndex?.has(data.item_id)) {
+      state.respPendingArgs ??= new Map();
+      state.respPendingArgs.set(data.item_id, (state.respPendingArgs.get(data.item_id) || "") + argsDelta);
+      return null;
+    }
+
     const known = data.item_id ? state.respToolChatIndex?.get(data.item_id) : undefined;
     const idx = known ?? Math.max(0, (state.toolCallIndex || 1) - 1);
     state.respToolArgsEmitted ??= new Set();
@@ -672,12 +697,45 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     );
   }
 
+  // Reasoning item done: carry the opaque encrypted blob forward so clients
+  // that store history (Claude thinking signature / redacted_thinking data)
+  // can replay reasoning continuity on the next turn (Meta store=false flow).
+  if (eventType === "response.output_item.done" && data.item?.type === RESPONSES_ITEM.REASONING) {
+    const enc = data.item.encrypted_content || state.respReasoningEncrypted;
+    if (typeof enc === "string" && enc) {
+      return buildChunk(
+        { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+        { reasoning_content: "", encrypted_content: enc }
+      );
+    }
+    return null;
+  }
+  if (eventType === "response.output_item.added" && data.item?.type === RESPONSES_ITEM.REASONING) {
+    if (typeof data.item.encrypted_content === "string" && data.item.encrypted_content) {
+      state.respReasoningEncrypted = data.item.encrypted_content;
+    }
+    return null;
+  }
+
   // Function call done (standard or custom_tool_call variant).
   // Index was assigned at added-time; nothing to advance. Some upstreams send
   // complete arguments only here (no deltas) — emit them once in that case.
   if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const key = data.item?.id || data.item_id;
     const idx = (key && state.respToolChatIndex?.get(key)) ?? Math.max(0, (state.toolCallIndex || 1) - 1);
+    // Fragments buffered pre-added but never flushed (added missed): emit once.
+    if (key && state.respPendingArgs?.has(key)) {
+      const pending = state.respPendingArgs.get(key);
+      state.respPendingArgs.delete(key);
+      state.respToolArgsEmitted ??= new Set();
+      if (pending && !state.respToolArgsEmitted.has(idx)) {
+        state.respToolArgsEmitted.add(idx);
+        return buildChunk(
+          { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+          { tool_calls: [{ index: idx, function: { arguments: pending } }] }
+        );
+      }
+    }
     const fullArgs = data.item?.arguments;
     if (typeof fullArgs === "string" && fullArgs) {
       state.respToolArgsEmitted ??= new Set();

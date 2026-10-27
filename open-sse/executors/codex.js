@@ -269,6 +269,20 @@ export class CodexExecutor extends BaseExecutor {
       await this.prefetchImages(args.body);
     }
 
+    // Strip OpenAI-specific 'detail' field from INPUT_IMAGE blocks before forwarding to Codex API.
+    // Anthropic Claude API (which Codex forwards claude-opus models to) rejects this extra field.
+    if (Array.isArray(args.body?.input)) {
+      for (const item of args.body.input) {
+        if (Array.isArray(item.content)) {
+          for (const c of item.content) {
+            if (c.type === "input_image" && "detail" in c) {
+              delete c.detail;
+            }
+          }
+        }
+      }
+    }
+
     // Retry loop for SSE-level overloaded errors (200 OK body contains event: error)
     // Reuses 503 retry config — same semantic: upstream temporarily unavailable
     const retryConfig = { ...DEFAULT_RETRY_CONFIG, ...this.config.retry };

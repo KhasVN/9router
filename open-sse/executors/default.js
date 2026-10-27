@@ -2,6 +2,7 @@ import { BaseExecutor } from "./base.js";
 import { randomUUID } from "node:crypto";
 import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta, mergeAnthropicBeta } from "../providers/shared.js";
+import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry, CODEX_SSE_PEEK_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
 import { OAUTH_ENDPOINTS, buildKimiHeaders, NOUS_ATTRIBUTION } from "../config/appConstants.js";
 import { buildClineHeaders } from "../shared/clineAuth.js";
@@ -50,9 +51,6 @@ const HEADER_HOOKS = {
     h["X-Mavis-Timezone-Offset"] = String(new Date().getTimezoneOffset() * -60);
     if (!h["X-Mavis-Session-Id"]) h["X-Mavis-Session-Id"] = randomUUID();
   },
-  // Muse: x-api-version only on subscription (minted key) requests — plain
-  // Model API keys already work without it
-  museHeaders: (h, c) => { if (c?.accessToken && !c?.apiKey) h["x-api-version"] = "1.0.0"; },
   clineHeaders: (h, c) => Object.assign(h, buildClineHeaders(c.apiKey || c.accessToken)),
   kilocodeOrg: (h, c) => { if (c.providerSpecificData?.orgId) h["X-Kilocode-OrganizationID"] = c.providerSpecificData.orgId; },
 };
@@ -89,6 +87,13 @@ export class DefaultExecutor extends BaseExecutor {
         delete transformed.client_metadata;
       }
       stripUnsupportedParams(this.provider, model, transformed);
+      // Meta Responses continuity is encrypted-only (store:false): without
+      // this include, Muse Spark returns no reasoning blob to replay and
+      // multi-turn agent loops lose chain-of-thought. Responses wire only —
+      // Chat-wire bodies carry `messages`, not `input`.
+      if (this.provider === "muse" && Array.isArray(transformed.input)) {
+        transformed.include = [...new Set([...(transformed.include || []), "reasoning.encrypted_content"])];
+      }
     }
 
     return injectReasoningContent({ provider: this.provider, model, body: transformed });
@@ -115,6 +120,42 @@ export class DefaultExecutor extends BaseExecutor {
       if (!tags.some((tag) => typeof tag === "string" && tag.startsWith(prefix))) tags.push(fallback);
     }
     return { ...body, tags: [...new Set(tags)] };
+  }
+
+  // Muse: an upstream stream that closes before any output event is a
+  // transient failure (native Muse client retries the whole POST). Nothing
+  // has been forwarded downstream yet, so re-POST is safe; once output exists,
+  // retrying would duplicate a turn — hand the stream through untouched.
+  async execute(args) {
+    if (this.provider !== "muse" || !args.stream) return super.execute(args);
+    const retryConfig = { ...DEFAULT_RETRY_CONFIG, ...this.config.retry };
+    const { attempts, delayMs } = resolveRetryEntry(retryConfig[HTTP_STATUS.BAD_GATEWAY]);
+    let attempt = 0;
+    while (true) {
+      const result = await super.execute(args);
+      const peek = await peekResponsesStreamStart(result.response);
+      if (peek.outputSeen) {
+        if (peek.replacementBody) {
+          result.response = new Response(peek.replacementBody, {
+            status: result.response.status,
+            statusText: result.response.statusText,
+            headers: result.response.headers,
+          });
+        }
+        return result;
+      }
+      if (!peek.eofBeforeOutput) return result;
+      if (attempt >= attempts) {
+        result.response = new Response(
+          JSON.stringify({ error: { message: "muse upstream closed stream before output" } }),
+          { status: HTTP_STATUS.BAD_GATEWAY, headers: { "Content-Type": "application/json" } }
+        );
+        return result;
+      }
+      attempt++;
+      args.log?.debug?.("RETRY", `MUSE | stream closed before output, retry ${attempt}/${attempts} after ${delayMs / 1000}s`);
+      await new Promise(r => setTimeout(r, delayMs));
+    }
   }
 
   // Fallback json_schema → json_object for openai-compatible providers without native Structured Output.
@@ -380,6 +421,89 @@ export class DefaultExecutor extends BaseExecutor {
     // Kilocode uses device code flow, no refresh token support
     return null;
   }
+}
+
+// Events that prove a Responses stream produced model output. Lifecycle
+// (created/in_progress) and bare [DONE] do not count.
+const RESPONSES_OUTPUT_EVENTS = new Set([
+  "response.output_text.delta", "response.reasoning_summary_text.delta",
+  "response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+  "response.output_item.added", "response.output_item.done",
+  "response.completed", "response.incomplete", "response.failed", "error",
+]);
+const RESPONSES_PEEK_BYTES = 256 * 1024;
+
+// Inspect the head of a Responses SSE stream (bounded, Codex-peek pattern).
+// Returns { outputSeen, eofBeforeOutput, replacementBody } — replacementBody
+// replays buffered bytes plus the pending read so nothing is lost.
+async function peekResponsesStreamStart(response) {
+  const none = { outputSeen: false, eofBeforeOutput: false, replacementBody: null };
+  if (!response?.ok || !response.body) return none;
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType && !contentType.includes("text/event-stream")) return none;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let buffer = "", eventName = null, bytes = 0, pendingRead = null, outputSeen = false, eof = false;
+  let timer;
+  const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(null), CODEX_SSE_PEEK_TIMEOUT_MS); });
+  const inspect = (line) => {
+    line = line.trim();
+    if (!line) { eventName = null; return; }
+    if (line.startsWith("event:")) { eventName = line.slice(6).trim(); return; }
+    if (!line.startsWith("data:")) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const data = JSON.parse(payload);
+      if (RESPONSES_OUTPUT_EVENTS.has(data?.type || eventName)) outputSeen = true;
+    } catch { /* partial/non-JSON line — not output proof */ }
+  };
+  try {
+    while (!outputSeen && bytes < RESPONSES_PEEK_BYTES) {
+      pendingRead = reader.read();
+      const next = await Promise.race([pendingRead, deadline]);
+      if (!next) break; // Keep the pending read: replay must not lose its bytes.
+      pendingRead = null;
+      if (next.done) { eof = true; inspect(buffer + decoder.decode()); break; }
+      chunks.push(next.value);
+      bytes += next.value.byteLength;
+      buffer += decoder.decode(next.value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) inspect(line);
+    }
+  } catch {
+    // Reader failed before output: treat like EOF for retry purposes.
+    eof = true;
+    reader.cancel().catch(() => {});
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!outputSeen) {
+    reader.cancel().catch(() => {});
+    try { reader.releaseLock(); } catch { /* already released */ }
+    return { outputSeen: false, eofBeforeOutput: eof, replacementBody: null };
+  }
+  const replacementBody = new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+    },
+    async pull(controller) {
+      try {
+        const next = await (pendingRead || reader.read());
+        pendingRead = null;
+        if (next.done) { reader.releaseLock(); controller.close(); }
+        else controller.enqueue(next.value);
+      } catch (error) { reader.releaseLock(); controller.error(error); }
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } finally { reader.releaseLock(); }
+    },
+  });
+  return { outputSeen: true, eofBeforeOutput: false, replacementBody };
 }
 
 export default DefaultExecutor;

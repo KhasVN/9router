@@ -49,11 +49,35 @@ function isValidPdfPagesArg(filePath, pages) {
 // Helper: stop thinking block if started
 function stopThinkingBlock(state, results) {
   if (!state.thinkingBlockStarted) return;
+  // Carry opaque upstream reasoning continuity (Meta encrypted_content) as the
+  // Claude thinking signature so the client resends it next turn.
+  if (state.thinkingSignature) {
+    results.push({
+      type: "content_block_delta",
+      index: state.thinkingBlockIndex,
+      delta: { type: "signature_delta", signature: state.thinkingSignature }
+    });
+    state.thinkingSignature = null;
+  }
   results.push({
     type: "content_block_stop",
     index: state.thinkingBlockIndex
   });
   state.thinkingBlockStarted = false;
+}
+
+// Emit a signature that arrived without any summary text as redacted_thinking
+// (spec-shaped carrier for opaque reasoning blobs with no visible content).
+function flushOrphanThinkingSignature(state, results) {
+  if (!state.thinkingSignature || state.thinkingBlockStarted) return;
+  const idx = state.nextBlockIndex++;
+  results.push({
+    type: "content_block_start",
+    index: idx,
+    content_block: { type: CLAUDE_BLOCK.REDACTED_THINKING, data: state.thinkingSignature }
+  });
+  results.push({ type: "content_block_stop", index: idx });
+  state.thinkingSignature = null;
 }
 
 // Helper: stop text block if started
@@ -133,6 +157,13 @@ export function openaiToClaudeResponse(chunk, state) {
         usage: { input_tokens: 0, output_tokens: 0 }
       }
     });
+  }
+
+  // Opaque reasoning continuity blob (Responses encrypted_content): stash for
+  // emission with the thinking block at stop/finish time. Runs before the
+  // reasoning-text check because the carrier chunk has empty reasoning text.
+  if (typeof delta?.encrypted_content === "string" && delta.encrypted_content) {
+    state.thinkingSignature = delta.encrypted_content;
   }
 
   // Handle reasoning (thinking) across vendor shapes - GLM/DeepSeek/Qwen/MiniMax/etc.
@@ -224,6 +255,7 @@ export function openaiToClaudeResponse(chunk, state) {
   // Finish
   if (choice.finish_reason) {
     stopThinkingBlock(state, results);
+    flushOrphanThinkingSignature(state, results);
     stopTextBlock(state, results);
 
     for (const [idx, toolInfo] of state.toolCalls) {

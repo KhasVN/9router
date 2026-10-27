@@ -23,6 +23,22 @@ const creds = { apiKey: "k" };
 
 beforeEach(() => fetchMock.mockReset());
 
+it("filters protected header overrides before fetch without mutating saved values", async () => {
+  const ex = makeExec({ baseUrl: "https://fixture.invalid/api" });
+  const headers = Object.freeze(Object.fromEntries([
+    "Host", "Content-Length", "Content-Type", "Connection", "Transfer-Encoding",
+    "AUTHORIZATION", "Cookie", "X-Api-Key", "Proxy-Authorization",
+  ].map(name => [name, "blocked"]).concat([["X-Fixture", "allowed"]])));
+  fetchMock.mockResolvedValue(res(200));
+  await ex.execute({ model: "m", body: {}, stream: false, credentials: creds, providerOverrides: { headers } });
+  const sent = new Headers(fetchMock.mock.calls[0][1].headers);
+  expect(sent.get("authorization")).toBe("Bearer k");
+  expect(sent.get("content-type")).toBe("application/json");
+  expect(sent.get("x-fixture")).toBe("allowed");
+  expect([...sent.values()]).not.toContain("blocked");
+  expect(headers.AUTHORIZATION).toBe("blocked");
+});
+
 describe("BaseExecutor.execute — retry by status (config-driven)", () => {
   it("retries 502 `attempts` times then succeeds", async () => {
     const ex = makeExec({ baseUrl: "https://x/api", retry: { 502: { attempts: 3, delayMs: 0 } } });

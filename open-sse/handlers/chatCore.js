@@ -33,6 +33,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { stripContinuityFields, ensureReasoningSummary } from "./chatCore/continuity.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -41,26 +42,6 @@ import { resolveSessionId } from "../utils/sessionManager.js";
  * @param {object} options.credentials - Provider credentials
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
-/**
- * Remove translator-internal continuity fields from the outbound upstream
- * body. The Responses→Chat request translator stashes reasoning
- * `encrypted_content` on assistant messages so a later openai→responses
- * round-trip can restore the store=false continuity blob; that stash must
- * never reach an upstream provider. Chat-native proxies reject the unknown
- * assistant-message field and answer every turn with a literal "400" body
- * (observed with multi-turn Codex sessions via OpenAI-compatible nodes).
- */
-export function stripContinuityFields(body) {
-  if (!body || !Array.isArray(body.messages)) return body;
-  for (const msg of body.messages) {
-    if (msg && typeof msg === "object") {
-      delete msg.encrypted_content;
-      delete msg.reasoning_encrypted_content;
-    }
-  }
-  return body;
-}
-
 export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
@@ -213,6 +194,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
     if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
+    ensureReasoningSummary(translatedBody);
   } else {
     translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
     if (!translatedBody) {
@@ -225,6 +207,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     delete translatedBody._customToolNames;
     translatedBody.model = stripThinkingSuffix(upstreamModel);
     stripContinuityFields(translatedBody);
+    ensureReasoningSummary(translatedBody);
   }
 
   // Tool normalization: MCP-equivalent built-in dedup (Claude clients) + same-name
@@ -527,7 +510,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   // True non-streaming response
-  if (!stream) {
+  if (!stream || (!clientRequestedStreaming && providerRequiresStreaming)) {
     const result = await handleNonStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat: providerResponseFormat, reqLogger, toolNameMap, customToolNames, trackDone, appendLog });
     streamController.handleComplete();
     return result;

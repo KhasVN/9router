@@ -9,7 +9,7 @@ describe("Claude non-streaming response format regression", () => {
       choices: [{ message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
       usage: { prompt_tokens: 10, completion_tokens: 5 }
     };
-    const res = translateNonStreamingResponse(openaiBody, FORMATS.CLAUDE, FORMATS.OPENAI);
+    const res = translateNonStreamingResponse(openaiBody, FORMATS.OPENAI, FORMATS.CLAUDE);
     expect(res.type).toBe("message");
     expect(res.role).toBe("assistant");
     expect(res.content).toEqual([{ type: "text", text: "pong" }]);
@@ -20,7 +20,7 @@ describe("Claude non-streaming response format regression", () => {
       candidates: [{ content: { role: "model", parts: [{ text: "pong" }] }, finishReason: "STOP" }],
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 }
     };
-    const res = translateNonStreamingResponse(geminiBody, FORMATS.CLAUDE, FORMATS.GEMINI);
+    const res = translateNonStreamingResponse(geminiBody, FORMATS.GEMINI, FORMATS.CLAUDE);
     expect(res.type).toBe("message");
     expect(res.content?.[0]?.text).toBe("pong");
   });
@@ -38,7 +38,7 @@ describe("Claude non-streaming response format regression", () => {
       }],
       usage: { prompt_tokens: 20, completion_tokens: 15 }
     };
-    const res = translateNonStreamingResponse(openaiBody, FORMATS.CLAUDE, FORMATS.OPENAI);
+    const res = translateNonStreamingResponse(openaiBody, FORMATS.OPENAI, FORMATS.CLAUDE);
     expect(res.type).toBe("message");
     expect(res.stop_reason).toBe("tool_use");
     expect(res.content).toEqual([

@@ -307,8 +307,11 @@ function buildReasoningInputItem(msg) {
   if (!encrypted && !summaryText) return null;
 
   const item = { type: RESPONSES_ITEM.REASONING };
+  // Meta requires summary on every reasoning input item. Empty array when no text.
   if (summaryText) {
     item.summary = [{ type: RESPONSES_ITEM.SUMMARY_TEXT, text: summaryText }];
+  } else {
+    item.summary = [];
   }
   // encrypted_content is the continuity token for store=false backends
   if (encrypted) item.encrypted_content = encrypted;
@@ -358,9 +361,14 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
       // Multi-turn continuity for store=false Responses backends (Codex / Grok CLI):
       // re-emit a reasoning item before the assistant message when the chat-format
       // history carried reasoning text and/or encrypted_content from a prior turn.
+      // Meta rejects a reasoning item placed directly before a user/system/
+      // developer item, so only keep it when this turn also emits an assistant
+      // message or function_call item.
       if (msg.role === ROLE.ASSISTANT) {
         const reasoningItem = buildReasoningInputItem(msg);
-        if (reasoningItem) result.input.push(reasoningItem);
+        const willEmitTurnItem = (Array.isArray(msg.content) ? msg.content.length > 0 : !!msg.content)
+          || (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0);
+        if (reasoningItem && willEmitTurnItem) result.input.push(reasoningItem);
       }
 
       const contentType = msg.role === ROLE.USER ? RESPONSES_ITEM.INPUT_TEXT : RESPONSES_ITEM.OUTPUT_TEXT;
@@ -386,10 +394,15 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
       // Only push a message block if content is non-empty.
       // Assistant messages with only tool_calls have content: null — skip the
       // message block in that case; the tool_calls are pushed separately below.
+      // Meta requires intermediate assistant text preceding a function_call to
+      // carry phase:"commentary"; final answers carry no phase.
       if (content.length > 0) {
         result.input.push({
           type: RESPONSES_ITEM.MESSAGE,
           role: msg.role,
+          ...(msg.role === ROLE.ASSISTANT && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0
+            ? { phase: "commentary" }
+            : {}),
           content
         });
       }
