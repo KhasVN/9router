@@ -116,24 +116,16 @@ describe("commandcode-to-openai — finish", () => {
 });
 
 describe("commandcode-to-openai — error event", () => {
-  it("throws readable object errors instead of emitting a successful stop", () => {
-    expect(() => feed([
-      { type: "error", error: { type: "server_error", message: "Boom" } },
-    ])).toThrow('[CommandCode error: {"type":"server_error","message":"Boom"}]');
-  });
-
-  it("throws on finish-step with finishReason=error instead of emitting fake stop", () => {
-    expect(() => feed([
-      { type: "text-delta", text: "partial response" },
-      { type: "finish-step", finishReason: "error", error: "step failed" },
-    ])).toThrow("[CommandCode error: step failed]");
-  });
-
-  it("throws on finish with finishReason=error instead of emitting fake stop", () => {
-    expect(() => feed([
-      { type: "text-delta", text: "partial response" },
-      { type: "finish-step", finishReason: "stop" },
-      { type: "finish", finishReason: "error" },
-    ])).toThrow("[CommandCode error: upstream generation error]");
+  // Since 092c84ea an error event throws (so the stream is marked errored and can be
+  // retried) instead of being emitted as fake content with finish_reason "stop".
+  it("stringifies object errors so client sees readable message", () => {
+    let message = "";
+    try {
+      feed([{ type: "error", error: { type: "server_error", message: "Boom" } }]);
+    } catch (err) {
+      message = err.message;
+    }
+    expect(message).toContain("Boom");
+    expect(message).not.toContain("[object Object]");
   });
 });
